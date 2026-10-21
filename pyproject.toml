@@ -1,0 +1,17 @@
+[project]
+name = "localsearch"
+version = "0.3.0"
+description = "Local semantic search for your Mac: documents, photos, video and code, all on this Mac"
+requires-python = ">=3.14"
+dependencies = [
+    "numpy>=2.3",
+    "pyobjc-framework-avfoundation>=12.2.2",
+    "pyobjc-framework-avkit>=12.2.2",
+    "pyobjc-framework-cocoa>=12.2.2",
+    "pyobjc-framework-coreservices>=12.2.2",
+    "pyobjc-framework-quartz>=12.2.2",
+    "pyobjc-framework-vision>=12.2.2",
+]
+
+[tool.uv]
+package = false

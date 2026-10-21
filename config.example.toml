@@ -1,0 +1,62 @@
+# LocalSearch settings. The Settings window (menu bar icon > Settings) edits the folders here; the rest rarely changes.
+# The installer copies this file to config.toml, which is the one the app reads.
+
+# Folders to index.
+roots = ["~/Documents", "~/Desktop"]
+
+index = "~/localsearch/index.sqlite"
+log_dir = "~/localsearch/logs"
+
+[model]
+gguf = "~/localsearch/models/embeddinggemma-2-Q8_0.gguf"
+sha256 = "2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135"
+server = "/opt/homebrew/bin/llama-server"
+port = 18080
+args = ["--host", "127.0.0.1", "--embeddings", "--pooling", "mean", "-c", "2048", "-b", "2048", "-ub", "2048"]
+dim = 768
+query_prefix = "task: search result | query: {q}"
+doc_prefix = "title: {title} | text: {text}"
+batch = 8
+workers = 4
+mmproj = "~/localsearch/models/mmproj-embeddinggemma-2-Q8_0.gguf"  # image/audio encoder
+embed_first_chunks = 0    # 0 = embed every chunk with words
+
+[chunk]
+size = 1800
+overlap = 200
+
+[extract]
+pdftotext = "/opt/homebrew/bin/pdftotext"
+textutil = "/usr/bin/textutil"
+soffice = "/opt/homebrew/bin/soffice"  # fallback for .doc/.docx/.rtf textutil cannot read
+max_file_mb = 60
+timeout_s = 120
+
+[skip]
+# Never descended into. Any path component starting with "." is skipped too.
+under = ["~/Library"]
+types = []   # file types never indexed, e.g. ["csv", "txt"]; set in Settings
+bundle_suffixes = [".app", ".photoslibrary", ".imovielibrary", ".fcpbundle", ".bundle", ".framework", ".plugin", ".kext", ".logicx", ".band"]
+# Secrets: never opened.
+names = [".env", ".netrc", ".npmrc", ".pypirc", "id_rsa", "id_ed25519", "id_ecdsa", "credentials"]
+name_prefixes = [".env."]
+suffixes = [".pem", ".key", ".p12", ".pfx", ".keychain", ".keychain-db", ".kdbx"]
+
+[ocr]
+# Image-only PDF pages (fewer than min_chars letters/digits but an image) and screenshots. Text stays in the index.
+engine = "vision"          # Apple Vision, accurate mode
+min_chars = 25
+
+[media]
+# Photos, video and audio are taken from the roots above and from these folders (media only, no documents).
+roots = ["~/Movies", "~/Pictures", "~/Pictures/Photos Library.photoslibrary/originals", "~/Music"]
+keep_dirs = []            # folder names never treated as dataset folders
+max_mb = 4000
+audio_weight = 0.5         # soundtrack windows count half in ranking: llama.cpp's audio encoder is experimental
+
+[app]
+# The hotkey search window (app.py). Its query embedder runs on its own port, so it never takes the indexer's server.
+hotkey = "cmd+space"           # taken over from Spotlight once its shortcut is moved
+fallback_hotkey = "ctrl+option+space"   # used while Spotlight still holds cmd+space
+port = 18081
+idle_stop_min = 15         # stop the query embedder after this long without a search; keywords answer while it restarts

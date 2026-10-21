@@ -1,0 +1,25 @@
+# Allow-list: only the app's source is tracked. The index, logs, models, reports and your own config.toml stay on
+# this Mac and can never be committed by accident.
+/*
+!/.gitignore
+!/README.md
+!/.python-version
+!/pyproject.toml
+!/uv.lock
+!/config.example.toml
+!/app.py
+!/codesearch.py
+!/common.py
+!/indexer.py
+!/media.py
+!/ocr.py
+!/search.py
+!/watch.py
+!/macos/
+!/tools/
+/tools/*
+!/tools/install.sh
+!/tools/install_agent.sh
+!/tools/refresh.sh
+__pycache__/
+.DS_Store

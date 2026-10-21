@@ -1,0 +1,8 @@
+#!/bin/zsh
+# LocalSearch's front door: the search itself runs as a login agent (com.kritin.localsearch). Opening the app shows
+# its window when it is running, and starts it when it is not.
+if /usr/bin/pgrep -qf "localsearch/app\.py$"; then
+    /usr/bin/osascript -l JavaScript -e 'ObjC.import("Foundation"); $.NSDistributedNotificationCenter.defaultCenter.postNotificationNameObjectUserInfoDeliverImmediately("com.kritin.localsearch.show", $(), $(), true)' >/dev/null 2>&1
+else
+    /bin/launchctl kickstart "gui/$(id -u)/com.kritin.localsearch"
+fi
