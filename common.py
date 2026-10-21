@@ -209,12 +209,15 @@ class Embedder:
         self.proc = None
         self.peak_server_kb = 0
         self._stop = threading.Event()
-        if self._healthy() and (pid := orphan_server(self.cfg["port"])):
-            # Left behind by a run killed before it could stop it. Reusing it would keep it alive for good (and it
-            # may lack --mmproj): replace it with a server this process owns and stops.
+        if pid := orphan_server(self.cfg["port"]):
+            # Left behind by a run killed before it could stop it (maybe still loading, so not answering yet).
+            # Reusing it would keep it alive for good, and it may lack --mmproj: replace it with one this process
+            # owns and stops.
             os.kill(pid, signal.SIGTERM)
-            for _ in range(40):
-                if not self._healthy():
+            for _ in range(80):   # until it has exited and freed the port, not just stopped answering
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
                     break
                 time.sleep(0.25)
         if media:

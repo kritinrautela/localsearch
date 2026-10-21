@@ -21,5 +21,6 @@
 !/tools/install.sh
 !/tools/install_agent.sh
 !/tools/refresh.sh
+!/tools/selftest.py
 __pycache__/
 .DS_Store

@@ -173,5 +173,6 @@ shortcut, tick it again in System Settings.
 - `app.py` is the window (native macOS, PyObjC), `watch.py` keeps the index fresh, `codesearch.py` handles `code:`.
 - `common.py` blocks every network connection except to the Mac itself (127.0.0.1).
 - Settings live in `config.toml`, created from `config.example.toml` on install.
+- `tools/selftest.py` checks everything on made-up files after a change (`--live` also checks the running app).
 
 </details>

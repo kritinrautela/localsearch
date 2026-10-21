@@ -51,8 +51,15 @@ CREATE TABLE IF NOT EXISTS vectors (chunk INTEGER PRIMARY KEY, vec BLOB NOT NULL
 """
 
 
+def name_words(name):
+    """The words inside a name, so "playlist" finds make_playlist and makePlaylist: "make playlist"."""
+    parts = [p for p in re.split(r"_+|(?<=[a-z0-9])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", name or "") if p]
+    return " ".join(p.lower() for p in parts) if len(parts) > 1 else ""
+
+
 def index_path(cfg):
-    return expand(cfg.get("code", {}).get("index", "~/localsearch/code_index.sqlite"))
+    # Next to this file by default, so a copy of the program (a test, a second install) never writes into another's.
+    return expand(cfg.get("code", {}).get("index", str(HERE / "code_index.sqlite")))
 
 
 def code_roots(cfg):
@@ -230,7 +237,7 @@ def index(cfg, only=None, log=print):
             cid = db.execute("INSERT INTO chunks (file, line, line_end, name, text) VALUES (?, ?, ?, ?, ?)",
                              (fid, line, end, name, body)).lastrowid
             db.execute("INSERT INTO fts (rowid, name, body) VALUES (?, ?, ?)",
-                       (cid, os.path.basename(full) + " " + name, body))
+                       (cid, os.path.basename(full) + " " + name + " " + name_words(name), body))
         changed += 1
     scope = [str(r) for r in (only or code_roots(cfg))]
     # A full run also drops files of a folder taken out of the code roots.
