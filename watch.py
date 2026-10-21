@@ -173,12 +173,16 @@ class Watcher:
 
     def _nightly(self):
         """A full refresh once a night between 2 and 6, on mains power: it catches what the watch cannot (a folder
-        renamed while the Mac slept), and embeds anything the quick updates left for mains power."""
-        today = datetime.now().strftime("%Y-%m-%d")
-        if (datetime.now().hour not in NIGHT_HOURS or self.state.get("last_nightly") == today or on_battery()
+        renamed while the Mac slept), and embeds anything the quick updates left for mains power. A laptop asleep
+        through those hours gets it the next time it is on mains power instead, once 36 hours have gone by."""
+        now = datetime.now()
+        today = now.strftime("%Y-%m-%d")
+        missed = time.time() - self.state.get("last_nightly_at", 0) > 36 * 3600
+        if ((now.hour not in NIGHT_HOURS and not missed) or self.state.get("last_nightly") == today or on_battery()
                 or indexer_running()):
             return
         self.state["last_nightly"] = today
+        self.state["last_nightly_at"] = time.time()
         self._save_state()
         self.log("watch: nightly refresh")
         subprocess.Popen(["/bin/zsh", str(HERE / "tools" / "refresh.sh")], cwd=HERE, start_new_session=True,

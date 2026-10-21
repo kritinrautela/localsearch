@@ -84,7 +84,8 @@ class Searcher:
                                "ORDER BY v.chunk").fetchall()
         self.row_chunk = np.array([r[0] for r in rows], dtype=np.int64)
         self.row_file = np.array([r[1] for r in rows], dtype=np.int64)
-        self.matrix = np.frombuffer(b"".join(r[2] for r in rows), dtype=np.float16).reshape(len(rows), -1)
+        self.matrix = np.frombuffer(b"".join(r[2] for r in rows), dtype=np.float16).reshape(
+            len(rows), self.cfg["model"]["dim"])   # an explicit width: a fresh index has no vectors yet
         rows = self.db.execute("SELECT file, kind, t, t_end, vec FROM media ORDER BY id").fetchall()
         audio_w = self.cfg.get("media", {}).get("audio_weight", 0.5)
         self.media_file = np.array([r[0] for r in rows], dtype=np.int64)

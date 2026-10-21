@@ -672,7 +672,12 @@ def media_stage(db, cfg, stats):
     t0, last_log, done, vecs, paused = time.time(), 0, 0, Counter(), 0.0
     notes = Counter()
     paused += wait_for_power()
-    emb = Embedder(cfg, log, media=True)
+    try:
+        emb = Embedder(cfg, log, media=True)
+    except RuntimeError as e:   # the port stayed busy: these files stay queued for the next run
+        log(f"media: skipped this run ({e})")
+        stats["media_s"] = 0
+        return
 
     def one(row):
         t = time.time()

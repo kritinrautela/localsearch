@@ -217,6 +217,13 @@ class Embedder:
                 if not self._healthy():
                     break
                 time.sleep(0.25)
+        if media:
+            # A text-only server another run is using (code search embedding): wait for it to finish, then start one
+            # with the projector.
+            for _ in range(180):
+                if not self._healthy() or self._vision():
+                    break
+                time.sleep(5)
         if not self._healthy():
             self._start(cfg)
         if media:
@@ -224,6 +231,12 @@ class Embedder:
             if not props.get("modalities", {}).get("vision"):
                 raise RuntimeError(f"llama-server on port {self.cfg['port']} has no --mmproj; stop it and rerun")
             self.marker = props["media_marker"]   # random per server start
+
+    def _vision(self):
+        try:
+            return bool(json.load(OPENER.open(self.url + "/props", timeout=10)).get("modalities", {}).get("vision"))
+        except (urllib.error.URLError, OSError, ValueError):
+            return False
 
     def _healthy(self):
         try:
