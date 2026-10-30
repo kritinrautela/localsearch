@@ -147,6 +147,9 @@ def test_fresh_install(real):
         out = r.stdout + r.stderr
         check("first index runs without errors", r.returncode == 0 and "Traceback" not in out,
               out.strip().splitlines()[-1][-200:] if r.returncode else "")
+        wal = Path(cfg["index"] + "-wal")
+        check("the -wal file is cut back after a run", not wal.exists() or wal.stat().st_size == 0,
+              f"{wal.stat().st_size if wal.exists() else 0} bytes")
         db = sqlite3.connect(cfg["index"])
         files, chunks, vecs = db.execute("SELECT (SELECT count(*) FROM files), (SELECT count(*) FROM chunks), "
                                          "(SELECT count(*) FROM vectors)").fetchone()
@@ -195,10 +198,60 @@ def test_fresh_install(real):
         dst.commit()
         top = search.Searcher(novec, embedder=None).search("hose", "hybrid", 5, qvec=None)
         check("an index without vectors yet still finds words", bool(top) and top[0]["path"].endswith("garden.txt"))
+        test_handoff(tmp, cfg, db)
     finally:
         for port in (18090, 18091):
             stop_port(port)
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_handoff(tmp, cfg, db):
+    """2026-10-30: a refresh embedding for hours held the lock, so every quick update of a changed folder was turned
+    away (exit 75) and retried every 2 min until it finished. Now a refresh lets a waiting quick update go first."""
+    ls = tmp / "ls"
+    holder = subprocess.Popen([sys.executable, "-c",
+                               "import fcntl, time, indexer\n"
+                               "indexer.LOCK = open('state/indexer.lock', 'w')\n"
+                               "fcntl.flock(indexer.LOCK, fcntl.LOCK_EX)\n"
+                               "print('held', flush=True)\n"
+                               "end = time.time() + 120\n"
+                               "while time.time() < end:\n"
+                               "    indexer.yield_lock()\n"
+                               "    time.sleep(0.5)\n"],
+                              cwd=ls, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    try:
+        holder.stdout.readline()   # "held": the stand-in refresh owns the lock
+        (tmp / "docs" / "quick.txt").write_text("Receipt for the zanzibarquokka kayak hire.\n")
+        t = time.time()
+        r = subprocess.run([sys.executable, "indexer.py", "--no-wait", "--no-embed", "--paths", str(tmp / "docs")],
+                           cwd=ls, capture_output=True, text=True, timeout=180)
+        secs = time.time() - t
+        import search
+        top = search.Searcher(cfg, embedder=None).search("zanzibarquokka", "hybrid", 5, qvec=None)
+        check("a quick update gets in while a refresh holds the lock",
+              r.returncode == 0 and secs < 60 and bool(top) and top[0]["path"].endswith("quick.txt"),
+              f"exit {r.returncode}, {secs:.0f}s")
+        check("the refresh takes the lock back afterwards", holder.poll() is None)
+    finally:
+        holder.kill()
+        holder.wait()
+
+    sys.path.insert(0, str(ls))
+    import indexer
+    done = db.execute("SELECT c.id, c.text, f.path FROM chunks c JOIN files f ON f.id = c.file "
+                      "JOIN vectors v ON v.chunk = c.id LIMIT 2").fetchall()
+    gone = [(10**9, "no such chunk", "x.txt")]
+    check("a block drops chunks embedded or removed meanwhile", indexer.still_unembedded(db, done + gone) == [])
+    bad = tmp / "docs" / "raster.tif"
+    bad.write_bytes(b"II*\x00" + b"\x07" * 4096)
+    _, note = indexer.media_file(None, str(bad), "tif")
+    check("an image macOS cannot decode is not retried every run", (note or "").startswith("undecodable"),
+          (note or "")[:40])
+    big = tmp / "big.log"
+    big.write_bytes(b"x" * 2048)
+    import common
+    common.rotate(big, max_bytes=1024)
+    check("a log past its size limit is rotated", not big.exists() and (tmp / "big.log.1").exists())
 
 
 def test_orphan(real):

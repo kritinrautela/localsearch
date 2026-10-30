@@ -20,6 +20,7 @@ import io
 import json
 import os
 import re
+import sqlite3
 import resource
 import signal
 import subprocess
@@ -38,7 +39,7 @@ import numpy as np
 import common
 import media
 import ocr
-from common import HERE, HOME, Embedder, connect, expand, load_config, version_key
+from common import HERE, HOME, Embedder, connect, expand, load_config, rotate, version_key
 
 TEXT_EXT = {"txt", "md", "markdown", "text", "rst"}
 DOC_EXT = {"docx", "doc", "rtf", "odt", "html", "htm"}
@@ -443,6 +444,81 @@ def wait_for_power():
     return time.time() - t
 
 
+WANT = HERE / "state" / "indexer.want"   # a quick folder update waiting for the lock writes its pid here
+WANT_WAIT_S = 600                        # how long a quick update waits for a refresh to let it in
+
+
+def want_waiting():
+    """True while a live quick update is waiting for the lock; a file left by a dead one is cleared."""
+    try:
+        pid = int(WANT.read_text().strip() or 0)
+    except (OSError, ValueError):
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except (ProcessLookupError, ValueError):
+        WANT.unlink(missing_ok=True)
+        return False
+    except PermissionError:
+        return True
+
+
+def yield_lock():
+    """A full refresh can embed for hours. Between committed blocks it lets a waiting quick update (a folder that
+    just changed) run first, so new files are searchable within minutes instead of after the refresh."""
+    if not LOCK or PATHS or not want_waiting():
+        return 0
+    log("lock: letting a quick folder update run first")
+    t = time.time()
+    fcntl.flock(LOCK, fcntl.LOCK_UN)
+    while want_waiting() and time.time() - t < 120:
+        time.sleep(1)
+    fcntl.flock(LOCK, fcntl.LOCK_EX)   # blocks until the quick update is done
+    return time.time() - t
+
+
+def acquire_quick(lock):
+    """A quick update: take the lock, or ask a running refresh for it and wait up to WANT_WAIT_S."""
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except BlockingIOError:
+        pass
+    WANT.write_text(str(os.getpid()))
+    try:
+        deadline = time.time() + WANT_WAIT_S
+        while time.time() < deadline:
+            time.sleep(1)
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except BlockingIOError:
+                pass
+        return False
+    finally:
+        WANT.unlink(missing_ok=True)
+
+
+def still_unembedded(db, rows):
+    """The rows of a block whose chunk still exists with the same text and has no vector yet: while the lock was let
+    go, a quick update may have re-chunked or removed a file, or embedded its chunks itself."""
+    ids = [cid for cid, _, _ in rows]
+    q = ",".join("?" * len(ids))
+    live = dict(db.execute(f"SELECT c.id, c.text FROM chunks c LEFT JOIN vectors v ON v.chunk = c.id "
+                           f"WHERE c.id IN ({q}) AND v.chunk IS NULL", ids).fetchall())
+    return [r for r in rows if live.get(r[0]) == r[1]]
+
+
+def still_media_todo(db, rows):
+    """The rows of a block whose file is still indexed at the same path and not already embedded by a quick update."""
+    ids = [fid for fid, _, _ in rows]
+    q = ",".join("?" * len(ids))
+    live = dict(db.execute(f"SELECT id, path FROM files WHERE id IN ({q})", ids).fetchall())
+    done = {f for (f,) in db.execute(f"SELECT file FROM media_done WHERE file IN ({q}) AND error IS NULL", ids)}
+    return [r for r in rows if live.get(r[0]) == r[1] and r[0] not in done]
+
+
 def has_words(text):
     """DigUp's SearchText.hasWords: letters are at least a fifth of the non-space characters. A table of numbers
     (model outputs, coordinates, logs of figures) gets keyword search only: its vector would match nothing."""
@@ -487,8 +563,8 @@ def embed_stage(db, cfg, stats):
     try:
         with ThreadPoolExecutor(m["workers"]) as ex:
             for start in range(0, total, 512):
-                paused += wait_for_power()
-                rows = todo[start:start + 512]
+                paused += wait_for_power() + yield_lock()
+                rows = still_unembedded(db, todo[start:start + 512])
                 batches = [rows[i:i + m["batch"]] for i in range(0, len(rows), m["batch"])]
                 texts = [[m["doc_prefix"].format(title=Path(p).stem or "none", text=t) for _, t, p in b]
                          for b in batches]
@@ -626,7 +702,9 @@ def media_file(emb, full, ext):
                 return [], f"skipped: icon {w}x{h}"
             v = emb.embed_media(media.thumbnail(full))
         except OSError as e:
-            return [], why_unreadable(full) or str(e)
+            # The file opens but macOS cannot decode it (a multi-band GeoTIFF, say): a format problem, so it is not
+            # retried every run like a permission error; a changed file is looked at again anyway.
+            return [], why_unreadable(full) or ("undecodable: macOS cannot read this image format" if os.access(full, os.R_OK) else str(e))
         return ([("image", None, None, v)], None) if v is not None else ([], "server refused the image")
     if why := why_unreadable(full):
         return [], why
@@ -687,8 +765,8 @@ def media_stage(db, cfg, stats):
     try:
         with ThreadPoolExecutor(cfg["model"]["workers"]) as ex:
             for start in range(0, len(rows), 32):
-                paused += wait_for_power()
-                block = rows[start:start + 32]
+                paused += wait_for_power() + yield_lock()
+                block = still_media_todo(db, rows[start:start + 32])
                 for (fid, rel, ext), (out, note, secs) in zip(block, ex.map(one, block)):
                     for kind, t, t_end, v in out:
                         db.execute("INSERT INTO media (file, kind, t, t_end, vec) VALUES (?, ?, ?, ?, ?)",
@@ -744,16 +822,17 @@ def main():
     # One indexer at a time: a quick folder update gives way to a running refresh, a refresh waits for an update.
     (HERE / "state").mkdir(exist_ok=True)   # absent in a fresh copy
     lock = open(HERE / "state" / "indexer.lock", "w")
-    try:
-        fcntl.flock(lock, fcntl.LOCK_EX | (fcntl.LOCK_NB if PATHS else 0))
-    except BlockingIOError:
-        print("another indexer is running", flush=True)
-        return 75
+    if PATHS:
+        if not acquire_quick(lock):
+            print("another indexer is running", flush=True)
+            return 75
+    else:
+        fcntl.flock(lock, fcntl.LOCK_EX)
     LOCK = lock
     cfg = load_config(Path(args.config))
     logdir = expand(cfg["log_dir"])
     logdir.mkdir(parents=True, exist_ok=True)
-    LOG = open(logdir / "index.log", "a")
+    LOG = open(rotate(logdir / "index.log"), "a")
     t0 = time.time()
     stats = {"started": time.strftime("%Y-%m-%d %H:%M:%S"), "roots": cfg["roots"]}
     log(f"index start: roots {cfg['roots']} -> {expand(cfg['index'])}")
@@ -794,6 +873,14 @@ def main():
     out.mkdir(exist_ok=True)
     (out / "index_stats.json").write_text(json.dumps(stats, indent=1))
     log("index done: " + json.dumps(stats))
+    # Fold the -wal file into the index and cut it back: left alone it keeps its largest size (it reached 1.9 GB).
+    # A search reading at that moment only makes this a no-op; the next run tries again.
+    try:
+        busy, _, _ = db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        if busy:
+            db.execute("PRAGMA wal_checkpoint(PASSIVE)")
+    except sqlite3.OperationalError:
+        pass
 
 
 if __name__ == "__main__":

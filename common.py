@@ -112,6 +112,17 @@ def load_config(path=HERE / "config.toml"):
         return tomllib.load(f)
 
 
+def rotate(path, max_bytes=10_000_000):
+    """Logs only ever grow (llama-server.log reached 48 MB): past max_bytes the file becomes <name>.1 (the previous
+    .1 goes) and a new one starts. Returns path."""
+    try:
+        if path.stat().st_size > max_bytes:
+            os.replace(path, path.with_name(path.name + ".1"))
+    except OSError:
+        pass
+    return path
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS files (
     id INTEGER PRIMARY KEY,
@@ -164,6 +175,7 @@ def connect(cfg):
     db = sqlite3.connect(path, check_same_thread=False, timeout=60)  # wait out a short lock instead of failing
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA synchronous=NORMAL")
+    db.execute("PRAGMA journal_size_limit=67108864")   # shrink the -wal file back to 64 MB after a checkpoint
     db.executescript(SCHEMA)
     if "grp" not in {r[1] for r in db.execute("PRAGMA table_info(files)")}:
         db.execute("ALTER TABLE files ADD COLUMN grp TEXT")   # version group (common.version_key)
@@ -253,7 +265,7 @@ class Embedder:
         cmd = [self.cfg["server"], "-m", str(gguf), *self.cfg["args"], "--port", str(self.cfg["port"])]
         if self.media:
             cmd += ["--mmproj", str(expand(self.cfg["mmproj"]))]
-        logf = open(expand(cfg["log_dir"]) / "llama-server.log", "a")
+        logf = open(rotate(expand(cfg["log_dir"]) / "llama-server.log"), "a")
         self.log("starting llama-server: " + " ".join(cmd))
         self.proc = subprocess.Popen(cmd, stdout=logf, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
         ACTIVE.add(self)
