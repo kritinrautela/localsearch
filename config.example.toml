@@ -2,7 +2,9 @@
 # The installer copies this file to config.toml, which is the one the app reads.
 
 # Folders to index.
-roots = ["~/Documents", "~/Desktop"]
+roots = ["~/Documents", "~/Desktop", "~/Downloads"]
+# A Google Drive or iCloud folder can be added too, e.g. "~/Library/CloudStorage/GoogleDrive-you@gmail.com/My Drive".
+# Only files already on this Mac are read; online-only files are skipped, so nothing is downloaded.
 
 index = "~/localsearch/index.sqlite"
 log_dir = "~/localsearch/logs"

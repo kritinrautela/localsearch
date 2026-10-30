@@ -79,6 +79,32 @@ def test_compile():
         check(f"{sh} parses", r.returncode == 0)
 
 
+def test_cloud_root(real):
+    """A Google Drive root is searched although ~/Library is skipped; its "Mac Backups" folder and online-only files
+    are passed over without being opened."""
+    import collections
+    import indexer
+    tmp = Path(tempfile.mkdtemp(prefix="ls-cloud-"))
+    try:
+        drive = tmp / "Library" / "CloudStorage" / "Drive"
+        (drive / "Mac Backups").mkdir(parents=True)
+        (drive / "plan.txt").write_text("drive plan")
+        (drive / "Mac Backups" / "copy.txt").write_text("a copy")
+        cfg = copy.deepcopy(real)
+        cfg.update(roots=[str(drive)], media={**real.get("media", {}), "roots": []})
+        cfg["skip"] = {**real["skip"], "under": [str(tmp / "Library"), str(drive / "Mac Backups")]}
+        saved, indexer.CLOUD = indexer.CLOUD, str(tmp / "Library" / "CloudStorage")
+        try:
+            found = [os.path.basename(f) for f, _, _ in indexer.walk(cfg, collections.Counter())]
+        finally:
+            indexer.CLOUD = saved
+        check("a Google Drive folder is searched, its Mac Backups copy is not", found == ["plan.txt"], str(found))
+        check("a file on this Mac counts as local, a missing one does not",
+              indexer.on_this_mac(str(drive / "plan.txt")) and not indexer.on_this_mac(str(drive / "gone.txt")))
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_spoken_dates():
     """"invoice from last week" filters by date like date:week; a phrase inside the query or a year in a name stays
     a search word."""
@@ -401,6 +427,7 @@ def main():
     test_compile()
     before = real_counts(real)
     guarded("spoken dates", test_spoken_dates)
+    guarded("cloud folders", lambda: test_cloud_root(real))
     guarded("reranker", lambda: test_rerank(real))
     guarded("fresh install", lambda: test_fresh_install(real))
     after = real_counts(real)

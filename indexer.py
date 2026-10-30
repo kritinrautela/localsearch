@@ -90,6 +90,18 @@ def roots(cfg):
     return picked
 
 
+# A root in a synced cloud folder (Google Drive, iCloud, Dropbox) is searched even though ~/Library is skipped. Only
+# files already on this Mac are read: online-only ones are passed over, so indexing never downloads anything.
+CLOUD = str(HOME / "Library" / "CloudStorage")
+
+
+def on_this_mac(path):
+    try:
+        return not os.lstat(path).st_flags & SF_DATALESS
+    except OSError:
+        return False
+
+
 def walk(cfg, counts):
     """Yield (absolute path, ext, stat) for indexable files under the roots, applying the skip rules."""
     under = [str(expand(u)) for u in cfg["skip"]["under"]]
@@ -100,13 +112,15 @@ def walk(cfg, counts):
     skip_types = {t.lower().lstrip(".") for t in cfg["skip"].get("types", [])}
     for root, media_only in roots(cfg):
         if any(str(root) == u or str(root).startswith(u + "/") for u in under):
-            continue
+            if not str(root).startswith(CLOUD + "/"):
+                continue
         exts = MEDIA_EXT if media_only else ALL_EXT | MEDIA_EXT
         for dirpath, dirs, files in os.walk(root):
             keep = []
             for d in dirs:
                 full = os.path.join(dirpath, d)
-                if d.startswith(".") or d.lower().endswith(bundles) or any(full == u or full.startswith(u + "/") for u in under):
+                if d.startswith(".") or d.lower().endswith(bundles) or any(
+                        (full == u or full.startswith(u + "/")) and not str(root).startswith(u + "/") for u in under):
                     counts["skipped_dirs"] += 1
                 elif os.path.islink(full):
                     counts["skipped_links"] += 1
@@ -114,7 +128,8 @@ def walk(cfg, counts):
                     keep.append(d)
             dirs[:] = keep
             images = [f for f in files if f.rsplit(".", 1)[-1].lower() in media.IMAGE_EXT]
-            sample = [os.path.join(dirpath, f) for f in images[:: max(1, len(images) // 20)][:20]]
+            sample = [p for p in (os.path.join(dirpath, f) for f in images[:: max(1, len(images) // 20)][:20])
+                      if on_this_mac(p)]   # opening an online-only file would download it
             dataset = media.is_dataset(images, sample, os.path.basename(dirpath) in keep_dirs
                                        or ".photoslibrary" in dirpath)
             if dataset:
