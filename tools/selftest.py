@@ -79,6 +79,59 @@ def test_compile():
         check(f"{sh} parses", r.returncode == 0)
 
 
+def test_spoken_dates():
+    """"invoice from last week" filters by date like date:week; a phrase inside the query or a year in a name stays
+    a search word."""
+    from datetime import datetime
+    import app
+    day = lambda span: datetime.fromtimestamp(span[0]).strftime("%Y-%m-%d")
+    now = datetime.now()
+    spans = lambda q: [p for p in app.parse_filters(q)[2] if isinstance(p, tuple)]
+    ok = [app.parse_filters("invoice from last week")[0] == "invoice" and len(spans("invoice from last week")) == 1,
+          day(spans("notes yesterday")[0]) == (now.replace(hour=0) - __import__("datetime").timedelta(days=1)).strftime("%Y-%m-%d"),
+          day(spans("jorc table in sept 2025")[0]) == "2025-09-01",
+          day(spans("trip in 2025")[0]) == "2025-01-01"]
+    plain = ["today show notes", "tax return 2025", "notes in bali", "yesterday"]
+    ok += [app.parse_filters(q)[0] == q and not spans(q) for q in plain]
+    check("plain-English dates filter, plain words do not", all(ok), f"{sum(ok)}/{len(ok)}")
+    line = "01:47:00 embed: 24064/45807 (2.3 chunks/s, ETA 160.1 min), failed 0"
+    check("the menu says how long indexing has left, and when the Mac is busy",
+          app.eta_words(line, load=0.5) == ", about 2 h 40 min left"
+          and app.eta_words(line, load=3).endswith("(slower: the Mac is busy)") and app.eta_words("no eta") == "")
+
+
+def test_rerank(real):
+    """The second pass: re-orders documents among the top results, leaves photos in their places, keeps a code
+    query's order, and changes nothing on a bad answer. Then one real round trip through the model on a test port."""
+    import search
+    from common import rerank_cfg
+    doc = lambda n: {"path": f"d/{n}.txt", "snippet": n, "chunk": n, "versions": []}
+    photo = {"path": "p/beach.jpg", "snippet": "photo", "kind": "image", "versions": []}
+    hits = [doc(1), photo, doc(2), doc(3)]
+    new = search.reranked(hits, [0, 2, 3], [0.1, 0.2, 9.0])
+    # The blend is gentle: 3rd by today and 1st by the model ties with 1st by today, so only 2 and 3 swap.
+    check("rerank moves documents and leaves photos in place",
+          new[1] is photo and [h["chunk"] for h in (new[0], new[2], new[3])] == [1, 3, 2])
+    check("rerank changes nothing on a bad answer", search.reranked(hits, [0, 2, 3], None) == hits
+          and search.reranked(hits, [0, 2, 3], [1.0]) == hits)
+    check("a code or figure query keeps its exact-match order",
+          not search.wants_rerank("AE-1167 2,829,169", hits) and search.wants_rerank("lease bond refund", hits))
+    rc = rerank_cfg(real)
+    if rc is None:
+        print("skip  reranker round trip (model not on this Mac or switched off)")
+        return
+    rc["model"]["port"] = 18094
+    stop_port(18094)
+    rr = Embedder(rc, log=lambda m: None)
+    try:
+        s = rr.rerank("recipe for butter chicken", ["Garden hose and seeds budget.",
+                                                    "Butter chicken with garam masala and cream."])
+        check("the reranker answers and ranks the right text first", bool(s) and s[1] > s[0])
+    finally:
+        rr.close()
+        stop_port(18094)
+
+
 def fresh_config(tmp, real):
     cfg = copy.deepcopy(real)
     cfg.update(roots=[str(tmp / "docs")], index=str(tmp / "ls" / "index.sqlite"), log_dir=str(tmp / "ls" / "logs"))
@@ -300,8 +353,10 @@ def test_live(real):
     log = HERE / "logs" / "app.log"
     tb = log.read_text(errors="replace").count("Traceback") if log.exists() else 0
     check("app.log has no errors", tb == 0, f"{tb} tracebacks")
-    left = [p for p in (real["model"]["port"], real["app"]["port"]) if orphan_server(p)]
-    check("no left-behind servers on the app's or indexer's port", not left, str(left))
+    from common import RERANK
+    rr_port = {**RERANK, **real.get("rerank", {})}["port"]
+    left = [p for p in (real["model"]["port"], real["app"]["port"], rr_port) if orphan_server(p)]
+    check("no left-behind servers on the app's, indexer's or reranker's port", not left, str(left))
     queries = HERE / "evals" / "queries.json"
     if not queries.exists():
         print("skip  search quality (no evals/queries.json on this Mac)")
@@ -310,16 +365,29 @@ def test_live(real):
     import search
     cfg = copy.deepcopy(real)
     cfg["model"]["port"] = 18093
-    emb = Embedder(cfg, log=lambda m: None)
+    from common import rerank_cfg
+    rc = rerank_cfg(real)
+    emb, rr = Embedder(cfg, log=lambda m: None), None
     try:
+        if rc is not None:   # score what the window shows: the first order, then the reranker's second pass
+            rc["model"]["port"] = 18094
+            rr = Embedder(rc, log=lambda m: None)
         s = search.Searcher(real, embedder=emb)
         qs = [x for x in json.load(open(queries))["queries"] if x["tag"] not in ("image", "video")]
-        ranks = [first_rank(s.search(x["q"], "hybrid", 20, qvec=emb.query(x["q"])),
-                            set(x["expect"]) | set(x.get("expect_extra", []))) for x in qs]
+        ranks = []
+        for x in qs:
+            hits = s.search(x["q"], "hybrid", 20, qvec=emb.query(x["q"]))
+            if rr is not None and search.wants_rerank(x["q"], hits):
+                slots, texts = search.rerank_docs(s.db, hits)
+                hits = search.reranked(hits, slots, rr.rerank(x["q"], texts))
+            ranks.append(first_rank(hits, set(x["expect"]) | set(x.get("expect_extra", []))))
     finally:
         emb.close()
+        if rr is not None:
+            rr.close()
     m = metrics(ranks)
-    # 2026-10-22 baseline: top-1 72%, top-5 97%, MRR 0.831 on 58 text queries
+    # 2026-10-22 baseline: top-1 72%, top-5 97%, MRR 0.831 on 58 text queries. By 2026-10-30 the index had grown and
+    # the first order alone gave top-5 95%, MRR 0.778; with the reranker top-1 72%, top-5 97%, MRR 0.814.
     check("search quality holds", m["r5"] >= 0.95 and m["mrr"] >= 0.80,
           f"top1 {m['r1']:.0%}, top5 {m['r5']:.0%}, mrr {m['mrr']:.3f} on {len(qs)} queries")
 
@@ -332,6 +400,8 @@ def main():
     t = time.time()
     test_compile()
     before = real_counts(real)
+    guarded("spoken dates", test_spoken_dates)
+    guarded("reranker", lambda: test_rerank(real))
     guarded("fresh install", lambda: test_fresh_install(real))
     after = real_counts(real)
     ok = all((after[k][1] or 0) == 0 and after[k][0] >= 0.9 * n for k, (n, _) in before.items() if k in after)

@@ -1,5 +1,5 @@
 #!/bin/zsh
-# One-time setup on a new Mac: Homebrew tools, Python packages, the EmbeddingGemma 2 model, config.toml, the login
+# One-time setup on a new Mac: Homebrew tools, Python packages, the EmbeddingGemma 2 model and the reranker, config.toml, the login
 # agent and LocalSearch.app. Safe to run again: finished steps are skipped.
 set -e
 cd ~/localsearch 2>/dev/null || { echo "This folder must be at ~/localsearch (your home folder > localsearch)."; exit 1; }
@@ -24,7 +24,7 @@ fetch() {
         return
     fi
     echo "Downloading $name..."
-    curl -L --fail --progress-bar -C - -o models/$name.part $URL/$name
+    curl -L --fail --progress-bar -C - -o models/$name.part ${3:-$URL}/$name
     if [[ "$(shasum -a 256 models/$name.part | cut -d' ' -f1)" != $sum ]]; then
         echo "$name did not download correctly. Run this script again."
         mv models/$name.part ~/.Trash/ 2>/dev/null
@@ -34,6 +34,9 @@ fetch() {
 }
 fetch embeddinggemma-2-Q8_0.gguf 2188ac1deca4b77dffefd603c2776a9d76d9d74ec01841392982ebb840b09135
 fetch mmproj-embeddinggemma-2-Q8_0.gguf c4a8a52691ecef40618438928bdf9e68379b854e24166f292592353db0aab64f
+# The reranker that re-reads the top results of a search (about 640 MB, multilingual): gpustack's bge-reranker-v2-m3.
+fetch bge-reranker-v2-m3-Q8_0.gguf a43c7c9b11a4c1517e5bf95151960e1621d1b72f7a493364b01e386cf1aaa1d3 \
+    https://huggingface.co/gpustack/bge-reranker-v2-m3-GGUF/resolve/main
 
 [[ -f config.toml ]] || cp config.example.toml config.toml
 

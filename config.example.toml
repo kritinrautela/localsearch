@@ -60,3 +60,10 @@ hotkey = "cmd+space"           # taken over from Spotlight once its shortcut is 
 fallback_hotkey = "ctrl+option+space"   # used while Spotlight still holds cmd+space
 port = 18081
 idle_stop_min = 15         # stop the query embedder after this long without a search; keywords answer while it restarts
+
+[rerank]
+# A second pass that re-reads the top 10 results of a search and re-orders them (codes and figures keep their order).
+# It runs on 127.0.0.1 next to the query embedder and stops with it; enabled = false keeps the first order.
+enabled = true
+gguf = "~/localsearch/models/bge-reranker-v2-m3-Q8_0.gguf"
+port = 18082

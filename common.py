@@ -112,6 +112,23 @@ def load_config(path=HERE / "config.toml"):
         return tomllib.load(f)
 
 
+RERANK = {"enabled": True, "port": 18082, "server": "/opt/homebrew/bin/llama-server",
+          "gguf": "~/Library/Application Support/LocalSearch/Models/bge-reranker-v2-m3-Q8_0.gguf",
+          "sha256": "a43c7c9b11a4c1517e5bf95151960e1621d1b72f7a493364b01e386cf1aaa1d3",
+          "args": ["--host", "127.0.0.1", "--reranking", "-c", "8192", "-b", "8192", "-ub", "8192", "--parallel", "1"]}
+
+
+def rerank_cfg(cfg):
+    """A config whose [model] is the reranker ([rerank] in config.toml over RERANK), for an Embedder; None when it is
+    switched off or its model file is missing (searches then keep today's order)."""
+    r = {**RERANK, **cfg.get("rerank", {})}
+    if not r["enabled"] or not expand(r["gguf"]).exists():
+        return None
+    out = dict(cfg)
+    out["model"] = {**r, "dim": 0}
+    return out
+
+
 def rotate(path, max_bytes=10_000_000):
     """Logs only ever grow (llama-server.log reached 48 MB): past max_bytes the file becomes <name>.1 (the previous
     .1 goes) and a new one starts. Returns path."""
@@ -323,6 +340,19 @@ class Embedder:
             n = float(np.linalg.norm(v))
             out.append(v / n if n > 0 else None)
         return out
+
+    def rerank(self, query, docs):
+        """Relevance scores for docs against query, in docs' order, from a server started with --reranking; None if
+        it refused or is not a reranker."""
+        body = json.dumps({"query": query, "documents": docs, "top_n": len(docs)}).encode()
+        req = urllib.request.Request(self.url + "/v1/rerank", body, {"Content-Type": "application/json"})
+        try:
+            with OPENER.open(req, timeout=20) as r:
+                res = json.load(r)["results"]
+        except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError, KeyError, ValueError):
+            return None
+        scores = {d["index"]: float(d["relevance_score"]) for d in res}
+        return [scores.get(i, float("-inf")) for i in range(len(docs))] if len(scores) == len(docs) else None
 
     def embed_media(self, data):
         """Vector for one image (JPEG bytes) or sound clip (WAV bytes) through the projector; None if refused."""

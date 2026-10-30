@@ -22,6 +22,8 @@ Tahoe.
   like `12% of 340`, or a setting like `bluetooth`.
 - **Clipboard history**, a preview of every result, and actions like Show in Finder or Copy.
 - **Code search** with `code:` if you write code.
+- **A second look at the top results:** a moment after the first results appear, a second local model re-reads
+  the top 10 against what you typed and puts the best match first. Exact codes and numbers keep their order.
 
 ---
 
@@ -94,6 +96,7 @@ LocalSearch notices within 10 seconds and takes ⌘Space by itself. To undo, tic
 | Photos or videos | `photos beach sunset` or `video birthday` |
 | Only PDFs | `kind:pdf tax return` |
 | Recent files | `date:week notes` (also `date:today`, `date:month`, `date:2025`) |
+| ...or just say when | `invoice from last week`, `photos in march`, `notes yesterday`, `trip in 2025` |
 | By file name only | `name: cv` |
 | Things you copied | `clip: address` |
 | Code | `code: playlist shuffle` |

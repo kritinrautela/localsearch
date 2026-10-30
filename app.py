@@ -56,8 +56,8 @@ from pathlib import Path
 import numpy as np
 
 import common  # noqa: F401  (network guard before anything else opens a socket)
-from common import HERE, HOME, Embedder, expand, fold, load_config
-from search import Searcher, clock, code_tokens, terms
+from common import HERE, HOME, Embedder, expand, fold, load_config, rerank_cfg
+from search import Searcher, clock, code_tokens, rerank_docs, reranked, terms, wants_rerank
 import codesearch
 
 import AppKit
@@ -489,6 +489,10 @@ def parse_filters(q):
         return m[0]
     clean = re.sub(r"(?<!\S)(kind|in|date|tag):(\S+)", take, q, flags=re.IGNORECASE)
     clean = re.sub(r"\s+", " ", clean).strip()
+    if not any(isinstance(p, tuple) and p[0] != "tag" for p in places):
+        clean, span = spoken_date(clean)
+        if span:
+            places.append(span)
     if not exts:
         words = clean.split()
         # Only kind words at either end count ("gold video", "pdf licence"), never one inside a phrase.
@@ -538,6 +542,67 @@ def date_span(val):
     else:
         return None
     return (a.timestamp(), b.timestamp())
+
+
+MONTHS = {m: i for i, m in enumerate(["january", "february", "march", "april", "may", "june", "july", "august",
+                                       "september", "october", "november", "december"], 1)}
+MONTHS.update({m[:3]: i for m, i in list(MONTHS.items())} | {"sept": 9})
+SPOKEN_DATE = re.compile(
+    r"\s+(?:(?:from|on|since)\s+)?(?P<day>today|yesterday)$"
+    r"|\s+(?:(?:from|in|during)\s+)?(?P<rel>this|last|past)\s+(?P<unit>week|month|year)$"
+    r"|\s+(?:from|in|during)\s+(?P<mon>[a-z]+)(?:\s+(?P<monyear>(?:19|20)\d\d))?$"
+    r"|\s+(?:from|in|during)\s+(?P<year>(?:19|20)\d\d)$", re.IGNORECASE)
+
+
+def spoken_date(q):
+    """("invoice", span) for "invoice from last week", "photos in march", "notes yesterday", "trip in 2025".
+    Only a phrase at the end of the query, after other words, so "today show notes" or a year that is part of a
+    name ("tax return 2025") stay plain search words."""
+    m = SPOKEN_DATE.search(q)
+    if not m or not q[:m.start()].strip():
+        return q, None
+    now = datetime.now()
+    day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if m["day"]:
+        span = date_span(m["day"].lower())
+    elif m["unit"]:
+        unit, rel = m["unit"].lower(), m["rel"].lower()
+        if rel == "past":
+            span = date_span(unit)
+        elif unit == "week":
+            start = day - timedelta(days=day.weekday())
+            a, b = (start, now) if rel == "this" else (start - timedelta(days=7), start)
+            span = (a.timestamp(), b.timestamp())
+        elif unit == "month":
+            start = day.replace(day=1)
+            prev = (start - timedelta(days=1)).replace(day=1)
+            a, b = (start, now) if rel == "this" else (prev, start)
+            span = (a.timestamp(), b.timestamp())
+        else:
+            span = date_span(str(now.year if rel == "this" else now.year - 1))
+    elif m["mon"]:
+        mon = MONTHS.get(m["mon"].lower())
+        if mon is None:
+            return q, None
+        year = int(m["monyear"]) if m["monyear"] else (now.year if mon <= now.month else now.year - 1)
+        span = date_span(f"{year}-{mon}")
+    else:
+        span = date_span(m["year"])
+    return (q[:m.start()].strip(), span) if span else (q, None)
+
+
+def eta_words(line, load=None):
+    """", about 2 h 40 min left" from an indexer progress line ("... ETA 160.1 min ..."), plus a note when the Mac is
+    so busy that indexing runs slower (it runs at low priority: on 2026-10-30 a load of 24-37 cut it to a third)."""
+    m = re.search(r"ETA ([\d.]+) min", line)
+    if not m:
+        return ""
+    mins = round(float(m[1]))
+    out = ", almost done" if mins < 1 else f", about {mins} min left" if mins < 60 else \
+        f", about {mins // 60} h {mins % 60:02d} min left"
+    if load is None:
+        load = os.getloadavg()[0] / (os.cpu_count() or 8)
+    return out + (" (slower: the Mac is busy)" if load > 1.5 else "")
 
 
 def tag_filter(places):
@@ -1389,6 +1454,9 @@ class Engine:
         self.idle_stop = app.get("idle_stop_min", 15) * 60
         self.on_results, self.on_status = on_results, on_status
         self.searcher = None
+        self.rr_cfg = rerank_cfg(cfg)   # the second pass that re-reads the top results; None when switched off
+        self.rr, self.rr_starting = None, False
+        self.rq = queue.Queue()
         self.info = None
         self.emb = None
         self.emb_starting = False
@@ -1401,6 +1469,7 @@ class Engine:
         self.lock = threading.Lock()
         threading.Thread(target=self._loop, daemon=True).start()
         threading.Thread(target=self._idle, daemon=True).start()
+        threading.Thread(target=self._rerank_loop, daemon=True).start()
         self.q.put(("load", None, None))
 
     def index_stamp(self):
@@ -1423,6 +1492,7 @@ class Engine:
         self.last_use = time.time()
         if self.searcher is not None:
             self._ensure_embedder()
+            self._ensure_reranker()
 
     def reload_if_stale(self):
         if self.searcher is not None and self.index_stamp() > self.loaded_stamp + 30:
@@ -1461,16 +1531,64 @@ class Engine:
             threading.Thread(target=start, daemon=True).start()
         return None
 
+    def _ensure_reranker(self):
+        """The reranker if it is up; otherwise start it in the background and return None (today's order for now)."""
+        if self.rr is not None or self.rr_cfg is None:
+            return self.rr
+        if not self.rr_starting:
+            self.rr_starting = True
+
+            def start():
+                try:
+                    self.rr = Embedder(self.rr_cfg, log=lambda m: None)
+                except Exception as e:
+                    dbg("reranker failed:", e)
+                finally:
+                    self.rr_starting = False
+            threading.Thread(target=start, daemon=True).start()
+        return None
+
+    def _rerank_loop(self):
+        """Re-reads the top results of the latest meaning search and sends them again, re-ordered, about a second
+        after the first answer; a newer query by then means the work is dropped."""
+        while True:
+            job = self.rq.get()
+            while not self.rq.empty():   # only the newest query matters
+                job = self.rq.get()
+            gen, query, hits, info = job
+            rr = self._ensure_reranker()
+            if rr is None or gen != self.gen or self.searcher is None:
+                continue
+            t = time.time()
+            try:
+                slots, texts = rerank_docs(self.searcher.db, hits)
+                scores = rr.rerank(query, texts)
+            except Exception as e:
+                dbg("rerank failed:", e)
+                continue
+            if scores is None or gen != self.gen:
+                continue
+            new = reranked(hits, slots, scores)
+            if new != hits:
+                AppHelper.callAfter(self.on_results, gen, query, new,
+                                    {**info, "rerank_ms": (time.time() - t) * 1000})
+
     def _idle(self):
         while True:
             time.sleep(60)
-            if self.emb is not None and time.time() - self.last_use > self.idle_stop:
-                emb, self.emb = self.emb, None
-                emb.close()
+            if time.time() - self.last_use > self.idle_stop:
+                if self.emb is not None:
+                    emb, self.emb = self.emb, None
+                    emb.close()
+                if self.rr is not None:
+                    rr, self.rr = self.rr, None
+                    rr.close()
 
     def close(self):
         if self.emb is not None:
             self.emb.close()
+        if self.rr is not None:
+            self.rr.close()
 
     def _loop(self):
         last = None
@@ -1510,6 +1628,8 @@ class Engine:
                 hits = self.searcher.search(query, "hybrid", self.k, qvec=zero, exts=self.exts)
             info = {"ms": (time.time() - t) * 1000, "keywords_only": emb is None}
             AppHelper.callAfter(self.on_results, gen, query, hits, info)
+            if emb is not None and not query.startswith("like:") and wants_rerank(query, hits):
+                self.rq.put((gen, query, hits, info))
 
 
 class CodeEngine:
@@ -2977,7 +3097,7 @@ class Controller(NSObject):
             m = re.search(r"(\d[\d,]*)\s*/\s*(\d[\d,]*)", line)
             if m and ("media" in line or "embed" in line or "extract" in line):
                 stage = "photos and video" if "media" in line else "text" if "embed" in line else "reading files"
-                return f"{stage}, {m[1]} of {m[2]}"
+                return f"{stage}, {m[1]} of {m[2]}" + eta_words(line)
         return None
 
     def menuWillOpen_(self, menu):
