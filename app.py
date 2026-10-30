@@ -1555,14 +1555,14 @@ class Engine:
             job = self.rq.get()
             while not self.rq.empty():   # only the newest query matters
                 job = self.rq.get()
-            gen, query, hits, info = job
+            gen, query, asked, hits, info = job   # asked: the query as searched, after respelling
             rr = self._ensure_reranker()
             if rr is None or gen != self.gen or self.searcher is None:
                 continue
             t = time.time()
             try:
                 slots, texts = rerank_docs(self.searcher.db, hits)
-                scores = rr.rerank(query, texts)
+                scores = rr.rerank(asked, texts)
             except Exception as e:
                 dbg("rerank failed:", e)
                 continue
@@ -1616,20 +1616,22 @@ class Engine:
             t = time.time()
             emb = self._ensure_embedder()
             zero = np.zeros(self.cfg["model"]["dim"], np.float32)
+            fixes, asked = {}, query
             try:
                 if query.startswith("like:"):
                     hits = self.searcher.similar(query[5:], 40, self.exts) or []
                 else:
-                    hits = self.searcher.search(query, "hybrid", self.k, exts=self.exts,
-                                                qvec=emb.query(query) if emb is not None else zero)
+                    asked, fixes = self.searcher.respell(query)   # "reprot" searches as "report"
+                    hits = self.searcher.search(asked, "hybrid", self.k, exts=self.exts,
+                                                qvec=emb.query(asked) if emb is not None else zero)
             except Exception as e:  # the server went away mid-query: drop it and answer on keywords
                 dbg("search fell back to keywords:", e)
                 self.emb, emb = None, None
-                hits = self.searcher.search(query, "hybrid", self.k, qvec=zero, exts=self.exts)
-            info = {"ms": (time.time() - t) * 1000, "keywords_only": emb is None}
+                hits = self.searcher.search(asked, "hybrid", self.k, qvec=zero, exts=self.exts)
+            info = {"ms": (time.time() - t) * 1000, "keywords_only": emb is None, "respelled": sorted(set(fixes.values()))}
             AppHelper.callAfter(self.on_results, gen, query, hits, info)
-            if emb is not None and not query.startswith("like:") and wants_rerank(query, hits):
-                self.rq.put((gen, query, hits, info))
+            if emb is not None and not query.startswith("like:") and wants_rerank(asked, hits):
+                self.rq.put((gen, query, asked, hits, info))
 
 
 class CodeEngine:
@@ -3954,6 +3956,8 @@ class Controller(NSObject):
                 left = "Searching…"
             if same and self.info.get("keywords_only"):
                 left += " · words only while meaning starts"
+            if same and self.info.get("respelled"):
+                left += " · also searched " + ", ".join(self.info["respelled"])
             if self.exts or self.places:
                 kinds = ("videos" if self.exts <= VIDEO_EXT else "photos" if self.exts <= IMAGE_EXT
                          else "photos and videos" if self.exts <= IMAGE_EXT | VIDEO_EXT

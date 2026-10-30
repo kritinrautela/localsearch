@@ -22,6 +22,7 @@ import os
 import re
 import sqlite3
 import resource
+import shutil
 import signal
 import subprocess
 import sys
@@ -44,6 +45,10 @@ from common import HERE, HOME, Embedder, connect, expand, load_config, rotate, v
 TEXT_EXT = {"txt", "md", "markdown", "text", "rst"}
 DOC_EXT = {"docx", "doc", "rtf", "odt", "html", "htm"}
 SHEET_EXT = {"xlsx", "csv"}
+# A sheet keeps its first 2 MB of text: enough for its headings, codes and sample rows. Model grids and training
+# tables run to 100+ MB of numbers each, made the index 11 GB and the word index slow to write, and nobody searches
+# their millionth row. Every sheet the test questions expect is well under this.
+SHEET_CHARS = 2_000_000
 ALL_EXT = TEXT_EXT | DOC_EXT | SHEET_EXT | {"pdf", "pptx"}
 MEDIA_EXT = media.IMAGE_EXT | media.VIDEO_EXT | media.AUDIO_EXT
 SF_DATALESS = 0x40000000   # an iCloud / Drive file whose bytes are still in the cloud: reading it would download it
@@ -95,6 +100,18 @@ def roots(cfg):
 CLOUD = str(HOME / "Library" / "CloudStorage")
 
 
+def copy_elsewhere(full, st, same_as):
+    """True when this file sits in a folder that mirrors another indexed one ([skip] same_as, e.g. a Drive snapshot of
+    a Desktop folder) and the other copy has the same size, so the file is found once, not twice."""
+    for src, dst in same_as.items():
+        if full.startswith(src + "/"):
+            try:
+                return os.stat(dst + full[len(src):]).st_size == st.st_size
+            except OSError:
+                return False
+    return False
+
+
 def on_this_mac(path):
     try:
         return not os.lstat(path).st_flags & SF_DATALESS
@@ -110,6 +127,7 @@ def walk(cfg, counts):
     media_bytes = cfg.get("media", {}).get("max_mb", 4000) * 1_000_000
     keep_dirs = set(cfg.get("media", {}).get("keep_dirs", []))
     skip_types = {t.lower().lstrip(".") for t in cfg["skip"].get("types", [])}
+    same_as = {str(expand(k)): str(expand(v)) for k, v in cfg["skip"].get("same_as", {}).items()}
     for root, media_only in roots(cfg):
         if any(str(root) == u or str(root).startswith(u + "/") for u in under):
             if not str(root).startswith(CLOUD + "/"):
@@ -164,6 +182,9 @@ def walk(cfg, counts):
                     continue
                 if st.st_size > (media_bytes if ext in MEDIA_EXT else max_bytes):
                     counts["skipped_too_big"] += 1
+                    continue
+                if copy_elsewhere(full, st, same_as):
+                    counts["skipped_copy_elsewhere"] += 1
                     continue
                 yield full, ext, st
 
@@ -260,8 +281,22 @@ def xlsx_pages(path):
                     lines.append(" | ".join(v for v in row if v))
                 row = []
                 el.clear()
-        pages.append((i, "\n".join(lines)))
+        pages.append((i, capped(lines)))
     return pages
+
+
+def capped(lines):
+    """Join lines until SHEET_CHARS, then say how many rows were left out."""
+    out, size, rest = [], 0, 0
+    for line in lines:
+        if size >= SHEET_CHARS:
+            rest += 1
+            continue
+        out.append(line[:SHEET_CHARS - size])
+        size += len(out[-1]) + 1
+    if rest:
+        out.append(f"({rest:,} more rows not indexed)")
+    return "\n".join(out)
 
 
 def csv_pages(path):
@@ -271,7 +306,7 @@ def csv_pages(path):
     except csv.Error:
         dialect = csv.excel
     rows = csv.reader(io.StringIO(text), dialect)
-    return [(None, "\n".join(" | ".join(c.strip() for c in r if c.strip()) for r in rows if any(c.strip() for c in r)))]
+    return [(None, capped(" | ".join(c.strip() for c in r if c.strip()) for r in rows if any(c.strip() for c in r)))]
 
 
 def extract(path, ext, cfg):
@@ -345,9 +380,13 @@ def work(path, ext, cfg):
 
 # --- stages ----------------------------------------------------------------------------------------------------------
 
+REMOVED = [0]   # characters of text taken out of the word indexes this run
+
+
 def remove_file(db, file_id):
     rows = db.execute("SELECT id, text FROM chunks WHERE file = ?", (file_id,)).fetchall()
     ids = [r[0] for r in rows]
+    REMOVED[0] += sum(len(r[1] or "") for r in rows)
     db.executemany("DELETE FROM fts WHERE rowid = ?", [(i,) for i in ids])
     # tri is an external-content table: a delete must carry the old text, before the chunk row goes.
     db.executemany("INSERT INTO tri (tri, rowid, text) VALUES ('delete', ?, ?)", rows)
@@ -360,14 +399,15 @@ def remove_file(db, file_id):
 
 def extract_stage(db, cfg, stats):
     counts = Counter()
-    known = {p: (i, s, m) for i, p, s, m in db.execute("SELECT id, path, size, mtime FROM files")}
+    known = {p: (i, s, m, c) for i, p, s, m, c in db.execute("SELECT id, path, size, mtime, chars FROM files")}
     todo, seen = [], set()
     for full, ext, st in walk(cfg, counts):
         rel = os.path.relpath(full, HOME)
         seen.add(rel)
         counts["found_" + ext] += 1
         old = known.get(rel)
-        if old and old[1] == st.st_size and old[2] == st.st_mtime:
+        if old and old[1] == st.st_size and old[2] == st.st_mtime and not (
+                ext == "csv" and (old[3] or 0) > SHEET_CHARS + 100_000):   # a CSV indexed before the cap
             counts["unchanged"] += 1
             continue
         todo.append((full, rel, ext, st))
@@ -377,7 +417,7 @@ def extract_stage(db, cfg, stats):
     prefixes = tuple(os.path.relpath(r, HOME) + "/" for r, _ in roots(cfg))
     # A full run also drops files of a folder taken out of the settings (a media root that is only unplugged stays).
     named = tuple(os.path.relpath(expand(r), HOME) + "/" for r in cfg["roots"] + cfg.get("media", {}).get("roots", []))
-    gone = [i for p, (i, _, _) in known.items() if p not in seen
+    gone = [i for p, (i, *_) in known.items() if p not in seen
             and (p.startswith(prefixes) or (PATHS is None and not p.startswith(named)))]
     for i in gone:
         remove_file(db, i)
@@ -896,6 +936,41 @@ def main():
             db.execute("PRAGMA wal_checkpoint(PASSIVE)")
     except sqlite3.OperationalError:
         pass
+    compact(db)
+
+
+def compact(db, min_free=1_000_000_000, merge_after=100_000_000):
+    """Give back space left by removed text (a full run only). FTS5 only marks deleted text, so after a run that took
+    out at least merge_after characters both word indexes are merged ('optimize'); then SQLite's freed pages are
+    returned to the disk with VACUUM, which never happens on its own. After capping the model-grid CSVs this took
+    the index from 11.7 GB to 3.9 GB. VACUUM runs only when at least min_free bytes and a quarter of the file are
+    free, and the disk has room for the copy."""
+    if PATHS is not None:
+        return False
+    if REMOVED[0] >= merge_after:
+        t = time.time()
+        try:
+            for table in ("fts", "tri"):
+                db.execute(f"INSERT INTO {table}({table}) VALUES ('optimize')")
+                db.commit()
+            log(f"compact: word indexes merged after {REMOVED[0] / 1e6:.0f} MB of text was removed, "
+                f"{time.time() - t:.0f}s")
+        except sqlite3.OperationalError as e:
+            log(f"compact: merge skipped ({e})")
+        REMOVED[0] = 0
+    page, count, free = (db.execute(f"PRAGMA {p}").fetchone()[0] for p in ("page_size", "page_count", "freelist_count"))
+    if free * page < min_free or free < count / 4 or shutil.disk_usage(HERE).free < 2 * (count - free) * page:
+        return False
+    t = time.time()
+    try:
+        db.execute("VACUUM")
+        db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except sqlite3.OperationalError as e:
+        log(f"compact: skipped ({e})")
+        return False
+    log(f"compact: {count * page / 1e9:.1f} GB -> {db.execute('PRAGMA page_count').fetchone()[0] * page / 1e9:.1f} GB "
+        f"in {time.time() - t:.0f}s")
+    return True
 
 
 if __name__ == "__main__":

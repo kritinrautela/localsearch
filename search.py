@@ -33,6 +33,9 @@ Z_GATE = 2.0
 WORD_WEIGHT = 2.0
 RRF_K = 60
 EXACT_MAX_FILES = 30   # a short plain phrase counts as a name only if it is this rare
+RESPELL_MIN = 3       # a typo is swapped only for a word in at least this many chunks, never for OCR noise
+COMMON_CHUNKS = 100_000   # a word in more chunks than this is left out of BM25 ranking (it still counts for coverage):
+                          # ranking a word found in 1.2 M chunks took 35 s and moved nothing, as its weight is ~0
 BM25_TOP = 10          # the best keyword matches earn a rank bonus in hybrid...
 BM25_WEIGHT = 2.0      # ...of BM25_WEIGHT / rank (doubled for lookups); tuned on evals/queries.json, Phase 4
 MEDIA_Z = 4.0          # a photo, frame or soundtrack this far above the text scale is a clearly visual match...
@@ -107,6 +110,15 @@ def reranked(hits, slots, scores):
     for slot, j in zip(slots, order):
         out[slot] = hits[slots[j]]
     return out
+
+
+def edits1(w):
+    """Every word one deletion, swap, change or insertion away from w (Norvig's speller)."""
+    letters = "abcdefghijklmnopqrstuvwxyz"
+    splits = [(w[:i], w[i:]) for i in range(len(w) + 1)]
+    return ({a + b[1:] for a, b in splits if b} | {a + b[1] + b[0] + b[2:] for a, b in splits if len(b) > 1}
+            | {a + c + b[1:] for a, b in splits if b for c in letters} | {a + c + b for a, b in splits for c in letters})
+    - {w}
 
 
 def clock(t):
@@ -195,22 +207,79 @@ class Searcher:
                 patterns[i] += "*"
         if not patterns:
             return [], {}, ts
-        hits, seen = [], set()
-        for f, cid, snip in self.db.execute(
-                "SELECT c.file, c.id, snippet(fts, 1, '«', '»', '…', 12) FROM fts JOIN chunks c ON c.id = fts.rowid "
-                "WHERE fts MATCH ? ORDER BY bm25(fts, 3.0, 1.0) LIMIT 1000", (" OR ".join(patterns),)):
-            if f not in seen and len(hits) < 100:
+        counts = {p: self.matches(p) for p in patterns}
+        ranking = [p for p in patterns if counts[p] <= COMMON_CHUNKS] or [min(patterns, key=counts.get)]
+        # Rank chunk ids first and make snippets only for the best chunk of each of the top 100 files: making 1000
+        # snippets inside the ranking query was 80-90% of a word search's time.
+        match = " OR ".join(ranking)
+        ids = [cid for (cid,) in self.db.execute("SELECT rowid FROM fts WHERE fts MATCH ? ORDER BY bm25(fts, 3.0, 1.0) "
+                                                 "LIMIT 1000", (match,))]
+        files = dict(self.db.execute(f"SELECT id, file FROM chunks WHERE id IN ({','.join(map(str, ids))})")) if ids else {}
+        top, seen = [], set()
+        for cid in ids:
+            f = files.get(cid)
+            if f is not None and f not in seen and len(top) < 100:
                 seen.add(f)
-                hits.append((f, cid, snip))
+                top.append((cid, f))
+        snips = dict(self.db.execute(
+            f"SELECT rowid, snippet(fts, 1, '«', '»', '…', 12) FROM fts WHERE fts MATCH ? "
+            f"AND rowid IN ({','.join(str(c) for c, _ in top) or 'NULL'})", (match,))) if top else {}
+        hits = [(f, cid, snips.get(cid, "")) for cid, f in top]
         coverage = {}
         if hits:
+            # Each file's chunks mostly sit in one rowid range, so FTS5 seeks into it instead of walking a word's
+            # whole list: 0.03 s instead of 20-30 s for a word in a million chunks. A file whose range a later OCR pass
+            # shared with another file has its hits checked against its own chunk ids.
             files = ",".join(str(h[0]) for h in hits)
+            spans = self.db.execute(f"SELECT file, min(id), max(id), count(*) FROM chunks WHERE file IN ({files}) "
+                                    "GROUP BY file").fetchall()
             for p in patterns:
-                for (f,) in self.db.execute(
-                        f"SELECT DISTINCT c.file FROM fts JOIN chunks c ON c.id = fts.rowid "
-                        f"WHERE fts MATCH ? AND c.file IN ({files})", (p,)):
-                    coverage[f] = coverage.get(f, 0) + 1 / len(patterns)
+                for f, lo, hi, n in spans:
+                    if self.in_file(p, f, lo, hi, n):
+                        coverage[f] = coverage.get(f, 0) + 1 / len(patterns)
         return hits, coverage, ts
+
+    def in_file(self, pattern, f, lo, hi, n):
+        """Whether file f (chunk ids lo..hi, n of them) holds the pattern."""
+        sql = "SELECT rowid FROM fts WHERE fts MATCH ? AND rowid BETWEEN ? AND ?"
+        if hi - lo + 1 == n:
+            return self.db.execute(sql + " LIMIT 1", (pattern, lo, hi)).fetchone() is not None
+        own = {i for (i,) in self.db.execute("SELECT id FROM chunks WHERE file = ?", (f,))}
+        return any(r in own for (r,) in self.db.execute(sql, (pattern, lo, hi)))
+
+    def respell(self, q):
+        """The query with each word that is in no file swapped for the most common indexed word one typo away
+        ("reprot" -> "report"), so meaning and keywords both see it; codes, numbers and short words stay as typed.
+        Returns (query, {typed: used})."""
+        fixes = {}
+        for w in set(re.findall(r"[^\W\d_]{5,}", q)):
+            lw = fold(w)   # the index keeps words lower-case without accents
+            if lw in fixes or self.vocab_docs([lw]):
+                continue
+            if len(lw) < 6:   # a 5-letter word has too many neighbours ("sunset" and "unset" are one apart)
+                continue
+            found = self.vocab_docs(c for c in edits1(lw) if c[0] == lw[0])   # typos rarely hit the first letter
+            best = max(found, key=lambda t: (found[t], t), default=None)
+            if best and found[best] >= RESPELL_MIN:
+                fixes[lw] = best
+        if not fixes:
+            return q, {}
+        return re.sub(r"[^\W\d_]{5,}", lambda m: fixes.get(fold(m[0]), m[0]), q), fixes
+
+    def vocab_docs(self, words, cap=50):
+        """{word: chunks holding it, counted up to cap} for the words in the index. FTS5 is asked, not its vocabulary,
+        because the index keeps Porter stems ("letters" is stored as "letter")."""
+        out = {}
+        for w in words:
+            n = self.matches('"' + w + '"', cap)
+            if n:
+                out[w] = n
+        return out
+
+    def matches(self, pattern, cap=COMMON_CHUNKS + 1):
+        """Chunks holding a word, counted up to cap."""
+        return self.db.execute("SELECT count(*) FROM (SELECT 1 FROM fts WHERE fts MATCH ? LIMIT ?)",
+                               (pattern, cap)).fetchone()[0]
 
     def phrase_files(self, phrase, limit=2000):
         """{file: (chunk, snippet, occurrences)} for chunks holding `phrase` as written (case and accents ignored), not

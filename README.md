@@ -22,6 +22,10 @@ Tahoe.
   like `12% of 340`, or a setting like `bluetooth`.
 - **Clipboard history**, a preview of every result, and actions like Show in Finder or Copy.
 - **Code search** with `code:` if you write code.
+- **Google Drive and other synced folders** can be added like any folder. Only files already on the Mac are read,
+  so indexing never downloads anything; `[skip] same_as` passes over a folder that copies one already searched.
+- **Big spreadsheets** keep their first 2 MB of text (headings, codes, early rows); model grids of millions of
+  rows no longer swell the index.
 - **A second look at the top results:** a moment after the first results appear, a second local model re-reads
   the top 10 against what you typed and puts the best match first. Exact codes and numbers keep their order.
 
@@ -97,6 +101,7 @@ LocalSearch notices within 10 seconds and takes ⌘Space by itself. To undo, tic
 | Only PDFs | `kind:pdf tax return` |
 | Recent files | `date:week notes` (also `date:today`, `date:month`, `date:2025`) |
 | ...or just say when | `invoice from last week`, `photos in march`, `notes yesterday`, `trip in 2025` |
+| Typos are fine | `quaterly finacial reprot` also searches `quarterly financial report` (shown at the bottom) |
 | By file name only | `name: cv` |
 | Things you copied | `clip: address` |
 | Code | `code: playlist shuffle` |

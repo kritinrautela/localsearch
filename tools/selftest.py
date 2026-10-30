@@ -105,6 +105,58 @@ def test_cloud_root(real):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_big_sheets():
+    """A CSV keeps its first SHEET_CHARS of text and says how many rows were left out (one giant line too), and a
+    file in a same_as copy folder is passed over only while the other copy has the same size."""
+    import indexer
+    tmp = Path(tempfile.mkdtemp(prefix="ls-sheet-"))
+    saved = indexer.SHEET_CHARS
+    try:
+        indexer.SHEET_CHARS = 1000
+        (tmp / "grid.csv").write_text("x,y,score\n" + "".join(f"{i},{i * 2},0.{i}\n" for i in range(5000)))
+        (tmp / "line.csv").write_text("a," * 5000)
+        grid = indexer.csv_pages(str(tmp / "grid.csv"))[0][1]
+        line = indexer.csv_pages(str(tmp / "line.csv"))[0][1]
+        check("a huge CSV keeps its start and notes the rows left out",
+              grid.startswith("x | y | score") and len(grid) < 1100 and "more rows not indexed" in grid, str(len(grid)))
+        check("a CSV of one giant line is cut to the limit too", len(line) <= 1000, str(len(line)))
+        (tmp / "a").mkdir(), (tmp / "b").mkdir()
+        (tmp / "a" / "f.txt").write_text("same"), (tmp / "b" / "f.txt").write_text("same")
+        (tmp / "b" / "g.txt").write_text("only in the copy")
+        m = {str(tmp / "b"): str(tmp / "a")}
+        st = lambda n: os.stat(tmp / "b" / n)
+        check("a file copied into a mirror folder is indexed once",
+              indexer.copy_elsewhere(str(tmp / "b" / "f.txt"), st("f.txt"), m)
+              and not indexer.copy_elsewhere(str(tmp / "b" / "g.txt"), st("g.txt"), m))
+        db = sqlite3.connect(tmp / "t.sqlite")
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("CREATE TABLE t (x)")
+        db.executemany("INSERT INTO t VALUES (?)", [("x" * 4000,)] * 2000)
+        db.commit()
+        db.execute("DELETE FROM t")
+        db.commit()
+        before = os.path.getsize(tmp / "t.sqlite")
+        ran = indexer.compact(db, min_free=1_000_000)
+        check("a mostly-empty index file is shrunk after a run", ran and os.path.getsize(tmp / "t.sqlite") < before / 4,
+              f"{before} -> {os.path.getsize(tmp / 't.sqlite')} bytes")
+        check("a full index file is left alone", not indexer.compact(db, min_free=1_000_000))
+        db.execute("CREATE VIRTUAL TABLE fts USING fts5(body)")
+        db.execute("CREATE VIRTUAL TABLE tri USING fts5(text, tokenize='trigram')")
+        for t in ("fts", "tri"):
+            db.executemany(f"INSERT INTO {t} VALUES (?)", [("deleted text " * 50,)] * 500)
+            db.commit()
+            db.execute(f"DELETE FROM {t}")
+            db.commit()
+        indexer.REMOVED[0] = 10**9
+        indexer.compact(db, min_free=1_000_000)
+        check("after a big removal the word indexes are merged", indexer.REMOVED[0] == 0
+              and db.execute("SELECT count(*) FROM tri_data").fetchone()[0] < 10)
+        db.close()
+    finally:
+        indexer.SHEET_CHARS = saved
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_spoken_dates():
     """"invoice from last week" filters by date like date:week; a phrase inside the query or a year in a name stays
     a search word."""
@@ -177,6 +229,8 @@ def toml(cfg):
             return str(v)
         if isinstance(v, list):
             return "[" + ", ".join(val(x) for x in v) + "]"
+        if isinstance(v, dict):   # an inline table, e.g. [skip] same_as
+            return "{" + ", ".join(f"{json.dumps(k)} = {val(x)}" for k, x in v.items()) + "}"
         return json.dumps(v)
     top = [f"{k} = {val(v)}" for k, v in cfg.items() if not isinstance(v, dict)]
     secs = [f"\n[{k}]\n" + "\n".join(f"{kk} = {val(vv)}" for kk, vv in v.items())
@@ -253,6 +307,15 @@ def test_fresh_install(real):
                       f"{hits}/{len(MEANING)}")
             top = s.search("hose", "hybrid", 5, qvec=None)
             check("keyword search", bool(top) and top[0]["path"].endswith("garden.txt"))
+            search.RESPELL_MIN = 1   # each made-up word is in one chunk
+            fixed, fixes = s.respell("quaterly packign list")
+            kept, none = s.respell("quarterly packing list AE-1167 sunst")
+            search.RESPELL_MIN = 3
+            check("a typo is searched as the word in your files; right words, codes and short words stay",
+                  fixed == "quarterly packing list" and kept == "quarterly packing list AE-1167 sunst" and not none,
+                  f"{fixes}")
+            top = s.search(fixed, "hybrid", 5, qvec=None)
+            check("a respelled search finds the file", bool(top) and top[0]["path"].endswith(("garden.txt", "trip.md")))
         finally:
             emb.close()
 
@@ -412,6 +475,13 @@ def test_live(real):
         if rr is not None:
             rr.close()
     m = metrics(ranks)
+    slow = []
+    for x in json.load(open(queries))["queries"]:
+        t = time.time()
+        s.words(x["q"])
+        slow.append(time.time() - t)
+    # 2026-10-30: a word found in 1.2 M CSV chunks made one keyword search take 90 s; the fix brought the worst to ~1 s
+    check("the slowest keyword search stays quick", max(slow) < 8, f"worst {max(slow):.1f}s of {len(slow)}")
     # 2026-10-22 baseline: top-1 72%, top-5 97%, MRR 0.831 on 58 text queries. By 2026-10-30 the index had grown and
     # the first order alone gave top-5 95%, MRR 0.778; with the reranker top-1 72%, top-5 97%, MRR 0.814.
     check("search quality holds", m["r5"] >= 0.95 and m["mrr"] >= 0.80,
@@ -428,6 +498,7 @@ def main():
     before = real_counts(real)
     guarded("spoken dates", test_spoken_dates)
     guarded("cloud folders", lambda: test_cloud_root(real))
+    guarded("big sheets", test_big_sheets)
     guarded("reranker", lambda: test_rerank(real))
     guarded("fresh install", lambda: test_fresh_install(real))
     after = real_counts(real)
