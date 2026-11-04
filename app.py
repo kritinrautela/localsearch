@@ -1179,6 +1179,29 @@ class History:
             self.uses = json.loads(self.upath.read_text())
         except (OSError, ValueError):
             self.uses = {i["path"]: [1, i.get("at", 0)] for i in self.items if i.get("path")}
+        self.kpath = STATE / "app_keys.json"   # what was typed -> {app path: times opened from it}
+        try:
+            self.keys = json.loads(self.kpath.read_text())
+        except (OSError, ValueError):
+            self.keys = {}
+
+    def learn(self, typed, path):
+        """Remember that typing this opened that app, so "dc" -> Discord sticks after one use (like Quick Keys)."""
+        typed = fold(typed.strip())
+        if not typed or len(typed) > 20:
+            return
+        seen = self.keys.setdefault(typed, {})
+        seen[path] = seen.get(path, 0) + 1
+        if len(self.keys) > 500:   # forget the oldest-learned keys
+            for k in list(self.keys)[:100]:
+                del self.keys[k]
+        try:
+            self.kpath.write_text(json.dumps(self.keys))
+        except OSError:
+            pass
+
+    def learned(self, typed):
+        return self.keys.get(fold(typed.strip()), {})
 
     def add(self, row):
         keep = {k: row.get(k) for k in ("kind", "path", "name", "page", "t", "chunk", "hitkind")}
@@ -1285,6 +1308,30 @@ def subsequence(q, text):
     return all(c in it for c in q)
 
 
+def typo_distance(a, b, cap=3):
+    """Edits (insert, delete, change, swap two neighbours) to turn a into b; stops counting at cap."""
+    if abs(len(a) - len(b)) >= cap:
+        return cap
+    prev2, prev = None, list(range(len(b) + 1))
+    for i in range(1, len(a) + 1):
+        cur = [i] + [0] * len(b)
+        for j in range(1, len(b) + 1):
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + (a[i - 1] != b[j - 1]))
+            if i > 1 and j > 1 and a[i - 1] == b[j - 2] and a[i - 2] == b[j - 1]:
+                cur[j] = min(cur[j], prev2[j - 2] + 1)
+        if min(cur) >= cap:
+            return cap
+        prev2, prev = prev, cur
+    return min(prev[-1], cap)
+
+
+def typo_prefix(q, text):
+    """Fewest edits between q and a start of text that is about as long: "discrod" vs "discord" is 1."""
+    if not text or q[0] != text[0]:   # people rarely miss the first letter; this keeps unrelated apps out
+        return 3
+    return min(typo_distance(q, text[:n]) for n in range(max(1, len(q) - 1), len(q) + 2))
+
+
 def index_built(cfg):
     """True once a full indexer run has finished (it records last_index)."""
     try:
@@ -1303,17 +1350,38 @@ class Apps:
     def __init__(self, history):
         self.apps = []
         self.history = history
+        self.loaded_at = 0.0
+        self.loading = False
+        self.refresh()
+
+    def refresh(self, max_age=600):
+        """Reload in the background when the list is old (new installs) or empty (Spotlight busy at login)."""
+        age = time.time() - self.loaded_at
+        if self.loading or (self.apps and age < max_age) or (not self.apps and age < 15):
+            return
+        self.loading = True
         threading.Thread(target=self.load, daemon=True).start()
 
     def load(self):
+        try:
+            self._load()
+        finally:
+            self.loaded_at, self.loading = time.time(), False
+
+    def _load(self):
         try:
             out = subprocess.run(["/usr/bin/mdfind", "kMDItemContentType == 'com.apple.application-bundle'"],
                                  capture_output=True, text=True, timeout=20).stdout.splitlines()
         except (OSError, subprocess.SubprocessError):
             out = []
         fm = AppKit.NSFileManager.defaultManager()
+        for d in APP_DIRS[:3] + ("/Applications/Utilities/", "/System/Applications/Utilities/"):
+            try:   # a plain folder listing too, so apps still show while Spotlight is indexing or broken
+                out += [os.path.join(d, e) for e in os.listdir(d) if e.endswith(".app")]
+            except OSError:
+                pass
         apps, seen = [], set()
-        for p in sorted(out, key=len):
+        for p in sorted(set(out), key=len):
             if not p.startswith(APP_DIRS) or ".app/" in p:
                 continue
             name = fm.displayNameAtPath_(p)
@@ -1331,7 +1399,11 @@ class Apps:
         if not q:
             return []
         out = []
+        taught = self.history.learned(q) if hasattr(self.history, "learned") else {}
         for a in self.apps:
+            if taught.get(a["path"]):   # you opened this app from exactly this text before
+                out.append((101 + min(taught[a["path"]], 10), False, a))
+                continue
             if a["low"].startswith(q):
                 s = 100 - len(a["low"]) * 0.1
             elif any(w.startswith(q) for w in a["words"]):
@@ -1344,11 +1416,22 @@ class Apps:
                                      for i, w in enumerate(a["words"])):
                 s = 40   # typed with letters left out: "wtsp" for WhatsApp, "pwrpt" for PowerPoint
             else:
+                s = 0
+            typo = False
+            if s < 78 and len(q) >= 4:   # a slip: "discrod", "chorme", "watsapp"; one slip is a Top Hit
+                words = a["words"] if len(q) >= 5 else a["words"][:1]   # "chorme" -> Google Chrome
+                d = min([typo_prefix(q, a["low"].replace(" ", ""))] + [typo_prefix(q, w) for w in words])
+                if len(q) == 4 and d == 1:   # four letters: only two swapped neighbours ("tpis"), else "visa" opens VS Code
+                    d = 1 if any(a["low"].replace(" ", "")[:4] == q[:i] + q[i + 1] + q[i] + q[i + 2:]
+                                 for i in range(3)) else 3
+                if d <= (2 if len(q) >= 7 else 1) and (78 if d == 1 else 66) > s:
+                    s, typo = (78 if d == 1 else 66), True
+            if not s:
                 continue
             s += min(self.history.count(a["path"]), 20) * 1.5
-            out.append((s, a))
+            out.append((s, typo, a))
         out.sort(key=lambda x: -x[0])
-        return [dict(a, score=s) for s, a in out[:n]]
+        return [dict(a, score=s, typo=typo) for s, typo, a in out[:n]]
 
 
 # --- global hotkey: Carbon RegisterEventHotKey, which needs no Accessibility permission ------------------------------
@@ -3187,6 +3270,7 @@ class Controller(NSObject):
         self.engine.warm()
         self.shortcuts.refresh()
         self.bookmarks.refresh()
+        self.apps.refresh()
         self.navigated = False
         if not self.panel.isVisible():
             screen = AppKit.NSScreen.mainScreen() or AppKit.NSScreen.screens()[0]
@@ -3803,7 +3887,8 @@ class Controller(NSObject):
             pass
         else:
             top = None
-            if apps and apps[0]["score"] >= 95 - min(len(q), 4) * 5:
+            literal = bool(hits) and fold(q) in fold(hits[0]["path"] + " " + hits[0]["snippet"].replace("«", "").replace("»", ""))
+            if apps and apps[0]["score"] >= 95 - min(len(q), 4) * 5 and not (apps[0]["typo"] and literal):
                 top = [{"kind": "app", **apps.pop(0)}]
             elif acts and acts[0]["score"] >= 90 and len(q) >= 3:
                 top = [acts.pop(0)]
@@ -4186,6 +4271,8 @@ class Controller(NSObject):
         self.history.add(r)
         full = r["path"]
         if kind == "app":
+            if self.clean and self.mode is None:
+                self.history.learn(self.clean, full)
             ws.openApplicationAtURL_configuration_completionHandler_(
                 NSURL.fileURLWithPath_(full), AppKit.NSWorkspaceOpenConfiguration.configuration(), None)
             return

@@ -178,6 +178,51 @@ def test_spoken_dates():
           and app.eta_words(line, load=3).endswith("(slower: the Mac is busy)") and app.eta_words("no eta") == "")
 
 
+def test_app_typos():
+    """An app name typed with one slip still finds the app as a Top Hit; everyday document words do not."""
+    import re
+    import app
+    from common import fold
+
+    class NoHistory:
+        def count(self, p):
+            return 0
+    a = app.Apps.__new__(app.Apps)
+    a.history, a.loading, a.loaded_at = NoHistory(), False, time.time()
+    a.apps = []
+    for name in ["Discord", "WhatsApp", "Google Chrome", "Spotify", "Obsidian", "Visual Studio Code", "Contacts",
+                 "Tips", "Prime Video", "Microsoft PowerPoint", "Print Center", "Grammarly Desktop", "Notes"]:
+        words = re.findall(r"[A-Za-z0-9]+", re.sub(r"([a-z])([A-Z])", r"\1 \2", name))
+        a.apps.append({"name": name, "path": f"/Applications/{name}.app", "low": fold(name),
+                       "initials": "".join(w[0] for w in words).lower(), "words": [fold(w) for w in words]})
+    top = lambda q: (a.match(q) or [{"name": None, "score": 0}])[0]
+    slips = {"discrod": "Discord", "dicord": "Discord", "discords": "Discord", "chorme": "Google Chrome",
+             "spotfy": "Spotify", "obsidain": "Obsidian", "watsapp": "WhatsApp"}
+    ok = [top(q)["name"] == want and top(q)["score"] >= 75 for q, want in slips.items()]
+    check("app names with a typo still open the app", all(ok), f"{sum(ok)}/{len(ok)}")
+    # these may still list an app lower down, but only as a slip, which a document holding the word outranks
+    words = ["visa", "trip", "deck", "core", "paint", "videos", "contract", "invoice", "report", "gold"]
+    ok = [not (m := a.match(q)) or m[0]["score"] < 75 or m[0]["typo"] for q in words]
+    check("everyday words are not taken for an app", all(ok), f"{sum(ok)}/{len(ok)}")
+    ok = [top("discord")["name"] == "Discord" and not top("discord")["typo"], app.typo_distance("discrod", "discord") == 1,
+          app.typo_prefix("xiscord", "discord") == 3]
+    check("exact app names stay exact matches", all(ok), f"{sum(ok)}/{len(ok)}")
+    tmp = Path(tempfile.mkdtemp())
+    try:   # a throwaway History, so the real app_keys.json is never touched
+        saved, app.STATE = app.STATE, tmp
+        h = app.History()
+        a.history = h
+        before = top("dc")["name"]
+        h.learn("dc", "/Applications/Discord.app")
+        again = app.History()
+        ok = [before != "Discord", top("dc")["name"] == "Discord", top("DC ")["name"] == "Discord",
+              again.learned("dc") == {"/Applications/Discord.app": 1}]
+        check("an app opened from short text comes first for that text next time", all(ok), f"{sum(ok)}/{len(ok)}")
+    finally:
+        app.STATE = saved
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_rerank(real):
     """The second pass: re-orders documents among the top results, leaves photos in their places, keeps a code
     query's order, and changes nothing on a bad answer. Then one real round trip through the model on a test port."""
@@ -497,6 +542,7 @@ def main():
     test_compile()
     before = real_counts(real)
     guarded("spoken dates", test_spoken_dates)
+    guarded("app typos", test_app_typos)
     guarded("cloud folders", lambda: test_cloud_root(real))
     guarded("big sheets", test_big_sheets)
     guarded("reranker", lambda: test_rerank(real))
