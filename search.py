@@ -117,8 +117,8 @@ def edits1(w):
     letters = "abcdefghijklmnopqrstuvwxyz"
     splits = [(w[:i], w[i:]) for i in range(len(w) + 1)]
     return ({a + b[1:] for a, b in splits if b} | {a + b[1] + b[0] + b[2:] for a, b in splits if len(b) > 1}
-            | {a + c + b[1:] for a, b in splits if b for c in letters} | {a + c + b for a, b in splits for c in letters})
-    - {w}
+            | {a + c + b[1:] for a, b in splits if b for c in letters} | {a + c + b for a, b in splits for c in letters}
+            ) - {w}
 
 
 def clock(t):

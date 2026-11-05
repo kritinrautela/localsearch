@@ -169,7 +169,7 @@ _CONSTS = {"pi": math.pi, "e": math.e}
 
 def calculate(q):
     """The value of an arithmetic expression (1,250 * 1.08, 2^10, sqrt(2), 15% of 80) as text, or None."""
-    s = q.strip().lower().replace("×", "*").replace("÷", "/").replace("^", "**").replace(",", "")
+    s = q.strip().strip("=").lower().replace("×", "*").replace("÷", "/").replace("^", "**").replace(",", "")
     if re.fullmatch(r"\d{4}[-/.]\d{1,2}([-/.]\d{1,2})?|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4}", s):
         return None   # a date, not a subtraction
     s = re.sub(r"(\d+(?:\.\d+)?)\s*% of\s*", r"(\1/100)*", s)
@@ -245,6 +245,16 @@ _u("volume", 1, "L", "l", "litre", "litres", "liter", "liters")
 _u("volume", 0.001, "mL", "ml", "millilitre", "millilitres")
 _u("volume", 3.785411784, "gal", "gallon", "gallons")
 _u("volume", 1000, "m³", "m3", "cubic metres", "cubic meters")
+_u("time", 1, "s", "sec", "secs", "second", "seconds")
+_u("time", 60, "min", "mins", "minute", "minutes")
+_u("time", 3600, "h", "hr", "hrs", "hour", "hours")
+_u("time", 86400, "d", "day", "days")
+_u("time", 604800, "wk", "week", "weeks")
+_u("time", 31557600, "yr", "year", "years")
+_u("data", 1, "KB", "kb", "kilobyte", "kilobytes")   # decimal, as Finder counts them
+_u("data", 1000, "MB", "mb", "megabyte", "megabytes")
+_u("data", 1e6, "GB", "gb", "gigabyte", "gigabytes")
+_u("data", 1e9, "TB", "tb", "terabyte", "terabytes")
 _TEMPS = {"c": "°C", "°c": "°C", "celsius": "°C", "f": "°F", "°f": "°F", "fahrenheit": "°F", "k": "K", "kelvin": "K"}
 
 
@@ -257,8 +267,8 @@ def fmt_number(v):
 def convert(q):
     """Conversions as [(result, expression, copyable number)], or None. A plain ounce is shown both ways, since an
     ounce of gold is a troy ounce."""
-    m = re.fullmatch(r"\s*(-?[\d.,]+)\s*([a-z°²³ 0-9]*?[a-z°²³])\s+(?:to|in|into|as|=)\s+([a-z°²³ 0-9]*?[a-z°²³])\s*",
-                     q.lower())
+    m = re.fullmatch(r"\s*(-?[\d.,]+)\s*([a-z°²³ 0-9]*?[a-z°²³23])\s+(?:to|in|into|as|=)\s+([a-z°²³ 0-9]*?[a-z°²³23])\s*",
+                     q.lower().strip().strip("=").strip())
     if not m:
         return None
     try:
@@ -461,6 +471,8 @@ IMPLICIT = {"pdf": {"pdf"}, "pdfs": {"pdf"}, "video": VIDEO_EXT, "videos": VIDEO
             **{e: {e} for e in IMAGE_EXT | VIDEO_EXT | AUDIO_EXT | {"docx", "xlsx", "pptx", "csv"}}}
 
 
+KIND_FILLER = {"file", "files", "my", "all", "the", "any", "recent", "latest", "new", "document", "documents", "docs"}
+
 RECENT_SKIP_EXT = {"pyc", "pyo", "log", "tmp", "lock", "db", "sqlite", "sqlite3", "wal", "shm", "part", "crdownload",
                    "plist", "o", "so", "dylib"}
 RECENT_SKIP_DIRS = ("/__pycache__/", "/node_modules/", "/site-packages/", "/venv/", "/build/", "/dist/")
@@ -488,6 +500,7 @@ def parse_filters(q):
             return " "
         return m[0]
     clean = re.sub(r"(?<!\S)(kind|in|date|tag):(\S+)", take, q, flags=re.IGNORECASE)
+    clean = re.sub(r"(?<!\S)-(?!\S)", " ", clean)   # a lone minus mid-typing ("pdf -" on the way to "pdf -draft")
     clean = re.sub(r"\s+", " ", clean).strip()
     if not any(isinstance(p, tuple) and p[0] != "tag" for p in places):
         clean, span = spoken_date(clean)
@@ -507,7 +520,8 @@ def parse_filters(q):
         if sets and rest:
             both = set.intersection(*map(set, sets))
             exts = both or set.union(*map(set, sets))
-            clean = " ".join(rest)
+            # "pdf files", "my photos", "all videos": nothing left to look for but the kind itself
+            clean = "" if all(w.lower() in KIND_FILLER for w in rest) else " ".join(rest)
     return clean, exts, places
 
 

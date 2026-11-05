@@ -238,6 +238,15 @@ def test_pause_targets():
           app.rename_problem("a.pdf", "x/y.pdf", str(HERE)), app.rename_problem("a.pdf", ".hidden", str(HERE)),
           app.rename_problem("a.pdf", "app.py", str(HERE))]
     check("rename refuses empty, slashes, hidden names and overwriting", ok[0] and all(ok[1:]), f"{sum(map(bool, ok))}/5")
+    sums = {"=2+2": "4", "2 + 2 =": "4", "100 m2 to sqft": "1,076.39 sq ft", "2 hours in minutes": "120 min",
+            "1 gb to mb": "1,000 MB", "3 days in hours": "72 h"}
+    got = {q: (app.answers(q) or [("",)])[0][0] for q in sums}
+    check("calculator takes = and m2/m3; converts time and data sizes", got == sums,
+          ", ".join(f"{q}->{v}" for q, v in got.items() if v != sums[q]))
+    pf = [app.parse_filters(q)[:2] for q in ("pdf files", "my photos", "pdf -", "gold pdf", "pdf")]
+    check("'pdf files' and 'my photos' list that kind; a lone minus is ignored; 'gold pdf' still searches gold",
+          pf[0] == ("", {"pdf"}) and pf[1][0] == "" and pf[1][1] and pf[2][0] == "pdf" and pf[3] == ("gold", {"pdf"})
+          and pf[4] == ("pdf", set()), str(pf))
     a, b = str(app.HOME / "x/a.pdf"), str(app.HOME / "y/b.pdf")
     rows = [{"path": a, "name": "a.pdf"}, {"path": str(app.HOME / "z.txt"), "name": "z.txt"}]
     moved, gone = app.follow_file(rows, a, b), app.follow_file(rows, a, None)
