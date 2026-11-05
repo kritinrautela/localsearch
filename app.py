@@ -1303,6 +1303,32 @@ APP_DIRS = ("/Applications/", "/System/Applications/", str(HOME / "Applications"
             "/System/Library/CoreServices/Applications/", "/System/Library/CoreServices/Finder.app")
 
 
+def rename_problem(old, new, folder):
+    """Why this rename can't happen, or None when it can."""
+    if not new or new == old:
+        return "Name unchanged"
+    if "/" in new or new.startswith(".") or new in ("..",):
+        return "A name can't contain / or start with a dot"
+    if os.path.exists(os.path.join(folder, new)) and new.lower() != old.lower():
+        return "Something with that name is already there"
+    return None
+
+
+def indexer_pids_in(ps_out, wrappers=False):
+    """Pids from `ps -axo pid=,command=` running indexer.py: the Python process only, or also its wrappers.
+    Pausing must stop the real indexer; stopping only `time`/`caffeinate` left them stuck after it finished."""
+    pids = []
+    for line in ps_out.splitlines():
+        pid, _, cmd = line.strip().partition(" ")
+        args = cmd.split()
+        if not pid.isdigit() or len(args) < 2 or not args[-1].endswith("indexer.py"):
+            continue
+        real = os.path.basename(args[0]).lower().startswith("python") and len(args) == 2
+        if real or (wrappers and os.path.basename(args[0]) in ("time", "caffeinate", "nice")):
+            pids.append(int(pid))
+    return pids
+
+
 def subsequence(q, text):
     it = iter(text)
     return all(c in it for c in q)
@@ -3155,9 +3181,10 @@ class Controller(NSObject):
 
     # menu ----------------------------------------------------------------------------------------------------------
     @objc.python_method
-    def indexer_pids(self):
-        out = subprocess.run(["/usr/bin/pgrep", "-f", r"python indexer\.py"], capture_output=True, text=True).stdout
-        return [int(x) for x in out.split()]
+    def indexer_pids(self, wrappers=False):
+        """The running indexer itself ("…/Python indexer.py"); with wrappers, also the time/caffeinate around it."""
+        out = subprocess.run(["/bin/ps", "-axo", "pid=,command="], capture_output=True, text=True).stdout
+        return indexer_pids_in(out, wrappers)
 
     @objc.python_method
     def indexer_paused(self, pids):
@@ -3212,6 +3239,8 @@ class Controller(NSObject):
         if not pids:
             return
         sig = signal.SIGCONT if self.indexer_paused(pids) else signal.SIGSTOP
+        if sig == signal.SIGCONT:   # wake the wrappers too, so one paused by an older version can finish up
+            pids = self.indexer_pids(wrappers=True)
         for pid in pids:
             try:
                 os.kill(pid, sig)
@@ -3309,6 +3338,8 @@ class Controller(NSObject):
         self.panel.orderOut_(None)
 
     def windowDidResignKey_(self, note):
+        if getattr(self, "in_dialog", False):
+            return
         if not self.ql_visible() and time.time() - self.ql_opened > 1.0:
             dbg("resign key")
             self.preview.stop()
@@ -3463,6 +3494,10 @@ class Controller(NSObject):
         elif ch in ("\x7f", "\x08") and 0 <= row < len(self.rows) and self.rows[row]["kind"] == "snippet":
             self.snippets.forget(self.rows[row]["item"])
             self.rebuild()
+        elif ch in ("\x7f", "\x08") and self.file_row(row):
+            self.trash(row)
+        elif ch == "z" and not shift and getattr(self, "last_trash", None):
+            self.put_back()
         else:
             return False
         return True
@@ -3546,6 +3581,12 @@ class Controller(NSObject):
             add(m, "Copy Name", "name", sym="textformat")
             add(m, "Unpin from Home" if self.pins.has(full) else "Pin to Home", "pin", "p", sym="pin")
             add(m, "Open Folder in Ghostty" if os.path.exists("/Applications/Ghostty.app") else "Open Folder in Terminal", "terminal", sym="terminal")
+            if self.file_row(row):   # what Raycast, Alfred and LaunchBar let you do to a file without opening Finder
+                m.addItem_(AppKit.NSMenuItem.separatorItem())
+                add(m, "Share…", "share", sym="square.and.arrow.up")
+                add(m, "Rename…", "rename", sym="pencil")
+                add(m, "Move to Folder…", "move", sym="folder.badge.plus")
+                add(m, "Move to Trash", "trash", "\x08", sym="trash")
         if r["kind"] == "clip":
             m.addItem_(AppKit.NSMenuItem.separatorItem())
             add(m, "Forget This Item", "forget", "\x08", sym="trash")
@@ -3596,6 +3637,14 @@ class Controller(NSObject):
         elif key == "clearclip":
             self.clipboard.forget()
             self.rebuild()
+        elif key == "share":
+            self.share(row)
+        elif key == "rename":
+            self.rename(row)
+        elif key == "move":
+            self.move_to(row)
+        elif key == "trash":
+            self.trash(row)
 
     @objc.python_method
     def picks(self):
@@ -4460,6 +4509,146 @@ class Controller(NSObject):
         if full:
             self.hide()
             AppKit.NSWorkspace.sharedWorkspace().activateFileViewerSelectingURLs_([NSURL.fileURLWithPath_(full)])
+
+    @objc.python_method
+    def file_row(self, row):
+        """The selected row's file when it is one of yours that can be renamed, moved or binned (not an app)."""
+        if not 0 <= row < len(self.rows) or self.rows[row]["kind"] not in ("hit", "file", "recent", "code"):
+            return None
+        full = self.target(row)
+        if not full or not full.startswith(str(HOME) + "/") or full.endswith(".app") or not os.path.exists(full):
+            return None
+        return full
+
+    @objc.python_method
+    def file_moved(self, row, old, new, note):
+        """Point the row (and pins) at the file's new place, or drop it, and say what happened."""
+        hits = []
+        for h in self.hits or []:
+            if str(HOME / h["path"]) == old:
+                if not new:
+                    continue
+                h = dict(h, path=os.path.relpath(new, HOME))
+            hits.append(h)
+        self.hits = hits
+        self.names = [new if p == old else p for p in (self.names or []) if new or p != old]
+        if self.pins.has(old):
+            self.pins.toggle("file", old, os.path.basename(old))
+            if new:
+                self.pins.toggle("file", new, os.path.basename(new))
+        self.rebuild()
+        self.foot_left.setStringValue_(note)
+
+    @objc.python_method
+    def dialog(self, fn):
+        """Run a modal sheet or alert without the panel hiding itself the moment it loses focus."""
+        self.in_dialog = True
+        try:
+            AppKit.NSApp.activateIgnoringOtherApps_(True)
+            return fn()
+        finally:
+            self.in_dialog = False
+            self.panel.makeKeyAndOrderFront_(None)
+            self.panel.makeFirstResponder_(self.field)
+
+    @objc.python_method
+    def share(self, row):
+        full = self.file_row(row)
+        if not full:
+            return
+        picker = AppKit.NSSharingServicePicker.alloc().initWithItems_([NSURL.fileURLWithPath_(full)])
+        rect = self.table.rectOfRow_(row)
+        picker.showRelativeToRect_ofView_preferredEdge_(rect, self.table, AppKit.NSMaxXEdge)
+
+    @objc.python_method
+    def rename(self, row):
+        full = self.file_row(row)
+        if not full:
+            return
+        old = os.path.basename(full)
+        alert = AppKit.NSAlert.alloc().init()
+        alert.setMessageText_("Rename")
+        alert.setInformativeText_(short_path(os.path.dirname(full)))
+        alert.addButtonWithTitle_("Rename")
+        alert.addButtonWithTitle_("Cancel")
+        box = AppKit.NSTextField.alloc().initWithFrame_(((0, 0), (320, 24)))
+        box.setStringValue_(old)
+        alert.setAccessoryView_(box)
+        alert.window().setInitialFirstResponder_(box)
+
+        def run():
+            ed_stem = len(os.path.splitext(old)[0]) if not os.path.isdir(full) else len(old)
+            AppHelper.callLater(0.05, lambda: box.currentEditor() and box.currentEditor().setSelectedRange_((0, ed_stem)))
+            return alert.runModal()
+        if self.dialog(run) != AppKit.NSAlertFirstButtonReturn:
+            return
+        new_name = box.stringValue().strip()
+        msg = rename_problem(old, new_name, os.path.dirname(full))
+        if msg:
+            self.foot_left.setStringValue_(msg)
+            return
+        new = os.path.join(os.path.dirname(full), new_name)
+        try:
+            os.rename(full, new)
+        except OSError as e:
+            self.foot_left.setStringValue_(f"Could not rename: {e.strerror}")
+            return
+        self.file_moved(row, full, new, f"Renamed to {new_name}")
+
+    @objc.python_method
+    def move_to(self, row):
+        full = self.file_row(row)
+        if not full:
+            return
+        op = AppKit.NSOpenPanel.openPanel()
+        op.setCanChooseDirectories_(True)
+        op.setCanChooseFiles_(False)
+        op.setCanCreateDirectories_(True)
+        op.setPrompt_("Move Here")
+        op.setMessage_(f"Move {os.path.basename(full)} to:")
+        op.setDirectoryURL_(NSURL.fileURLWithPath_(os.path.dirname(full)))
+        if self.dialog(op.runModal) != AppKit.NSModalResponseOK:
+            return
+        dest = os.path.join(op.URL().path(), os.path.basename(full))
+        if os.path.exists(dest):
+            self.foot_left.setStringValue_("A file with that name is already there; nothing moved")
+            return
+        ok, err = AppKit.NSFileManager.defaultManager().moveItemAtURL_toURL_error_(
+            NSURL.fileURLWithPath_(full), NSURL.fileURLWithPath_(dest), None)
+        if not ok:
+            self.foot_left.setStringValue_("Could not move it" + (f": {err.localizedDescription()}" if err else ""))
+            return
+        self.file_moved(row, full, dest, f"Moved to {short_path(os.path.dirname(dest))}")
+
+    @objc.python_method
+    def trash(self, row):
+        """Move to the Trash, never delete: cmd-Z (or Finder's Put Back) brings it back."""
+        full = self.file_row(row)
+        if not full:
+            return
+        ok, where, err = AppKit.NSFileManager.defaultManager().trashItemAtURL_resultingItemURL_error_(
+            NSURL.fileURLWithPath_(full), None, None)
+        if not ok:
+            self.foot_left.setStringValue_("Could not move it to the Trash" + (f": {err.localizedDescription()}" if err else ""))
+            return
+        self.last_trash = (full, where.path() if where else None)
+        self.file_moved(row, full, None, f"Moved {os.path.basename(full)} to the Trash · ⌘Z puts it back")
+
+    @objc.python_method
+    def put_back(self):
+        full, where = self.last_trash
+        self.last_trash = None
+        if not where or not os.path.exists(where) or os.path.exists(full):
+            self.foot_left.setStringValue_("Could not put it back; use Put Back in the Trash")
+            return
+        try:
+            os.rename(where, full)
+        except OSError as e:
+            self.foot_left.setStringValue_(f"Could not put it back: {e.strerror}")
+            return
+        self.names = [full] + list(self.names or [])
+        self.rebuild()
+        self.foot_left.setStringValue_(f"Put back {os.path.basename(full)}")
 
     @objc.python_method
     def copy_text(self, text):

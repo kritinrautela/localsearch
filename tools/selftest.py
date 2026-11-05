@@ -223,6 +223,26 @@ def test_app_typos():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_pause_targets():
+    """Pause stops the real indexer, not only the time/caffeinate wrappers (which then stuck every later refresh)."""
+    import app
+    ps = """  101 /usr/bin/time -l nice -n 10 .venv/bin/python indexer.py
+  102 caffeinate -s /usr/bin/time -l nice -n 10 .venv/bin/python indexer.py
+  103 /opt/homebrew/Frameworks/Python.framework/Versions/3.14/Resources/Python.app/Contents/MacOS/Python indexer.py
+  104 /bin/zsh /Users/x/localsearch/tools/refresh.sh
+  105 vim indexer.py
+  106 /usr/bin/python3 other.py"""
+    check("pause and resume reach the indexer itself", app.indexer_pids_in(ps) == [103]
+          and app.indexer_pids_in(ps, wrappers=True) == [101, 102, 103])
+    ok = [app.rename_problem("a.pdf", "b.pdf", str(HERE)) is None, app.rename_problem("a.pdf", "a.pdf", str(HERE)),
+          app.rename_problem("a.pdf", "x/y.pdf", str(HERE)), app.rename_problem("a.pdf", ".hidden", str(HERE)),
+          app.rename_problem("a.pdf", "app.py", str(HERE))]
+    check("rename refuses empty, slashes, hidden names and overwriting", ok[0] and all(ok[1:]), f"{sum(map(bool, ok))}/5")
+    sh = (HERE / "tools/refresh.sh").read_text()
+    check("a paused leftover wrapper cannot block refreshes", "kill -CONT" in sh
+          and sh.index("kill -CONT") < sh.index("already running"))
+
+
 def test_rerank(real):
     """The second pass: re-orders documents among the top results, leaves photos in their places, keeps a code
     query's order, and changes nothing on a bad answer. Then one real round trip through the model on a test port."""
@@ -320,8 +340,9 @@ def test_fresh_install(real):
         cfg = fresh_config(tmp, real)
         (tmp / "ls" / "config.toml").write_text(toml(cfg))
 
-        r = subprocess.run([sys.executable, "indexer.py"], cwd=tmp / "ls", capture_output=True, text=True,
-                           timeout=900)
+        from watch import on_battery   # on battery the indexer would wait for mains power and time out the test
+        r = subprocess.run([sys.executable, "indexer.py"] + (["--no-wait"] if on_battery() else []), cwd=tmp / "ls",
+                           capture_output=True, text=True, timeout=900)
         out = r.stdout + r.stderr
         check("first index runs without errors", r.returncode == 0 and "Traceback" not in out,
               out.strip().splitlines()[-1][-200:] if r.returncode else "")
@@ -543,6 +564,7 @@ def main():
     before = real_counts(real)
     guarded("spoken dates", test_spoken_dates)
     guarded("app typos", test_app_typos)
+    guarded("pause targets", test_pause_targets)
     guarded("cloud folders", lambda: test_cloud_root(real))
     guarded("big sheets", test_big_sheets)
     guarded("reranker", lambda: test_rerank(real))
