@@ -128,6 +128,7 @@ def walk(cfg, counts):
     keep_dirs = set(cfg.get("media", {}).get("keep_dirs", []))
     skip_types = {t.lower().lstrip(".") for t in cfg["skip"].get("types", [])}
     same_as = {str(expand(k)): str(expand(v)) for k, v in cfg["skip"].get("same_as", {}).items()}
+    given = set()   # a folder listed twice, or inside another listed folder, must not give a file twice
     for root, media_only in roots(cfg):
         if any(str(root) == u or str(root).startswith(u + "/") for u in under):
             if not str(root).startswith(CLOUD + "/"):
@@ -186,6 +187,10 @@ def walk(cfg, counts):
                 if copy_elsewhere(full, st, same_as):
                     counts["skipped_copy_elsewhere"] += 1
                     continue
+                if full in given:
+                    counts["skipped_listed_twice"] += 1
+                    continue
+                given.add(full)
                 yield full, ext, st
 
 
@@ -207,6 +212,9 @@ def run(cmd, cfg):
 
 def read_text(path):
     raw = open(path, "rb").read()
+    head = raw[:8192]
+    if head and sum(b < 32 and b not in b"\0\t\n\r\f\x1b" for b in head) > 0.05 * len(head):
+        return ""   # binary data under a text name: control bytes, not words
     for enc in ("utf-8", "utf-16") if raw[:2] in (b"\xff\xfe", b"\xfe\xff") else ("utf-8", "cp1252"):
         try:
             return raw.decode(enc)
@@ -671,8 +679,8 @@ def ocr_file(full, ext, cfg):
             texts = ocr.ocr_pdf_pages(full, pages, cfg["ocr"]["engine"]) if pages else {}
             return len(pages), sorted(texts.items()), None
         return 1, [(None, ocr.ENGINES[cfg["ocr"]["engine"]](full))], None
-    except (OSError, subprocess.SubprocessError) as e:
-        return 0, [], str(e)[:300]
+    except Exception as e:  # one bad file must not stop the run (as in work)
+        return 0, [], f"{type(e).__name__}: {e}"[:300]
 
 
 def ocr_stage(db, cfg, stats):

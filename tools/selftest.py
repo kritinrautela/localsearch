@@ -101,6 +101,37 @@ def test_cloud_root(real):
         check("a Google Drive folder is searched, its Mac Backups copy is not", found == ["plan.txt"], str(found))
         check("a file on this Mac counts as local, a missing one does not",
               indexer.on_this_mac(str(drive / "plan.txt")) and not indexer.on_this_mac(str(drive / "gone.txt")))
+        # 2026-11-06: a folder in both lists (or inside another listed one) gave each file twice and the second
+        # insert stopped the whole index with UNIQUE constraint failed: files.path.
+        pics = tmp / "pics"
+        (pics / "trip").mkdir(parents=True)
+        (pics / "trip" / "a.jpg").write_bytes(b"x")
+        (pics / "b.txt").write_text("b")
+        twice = copy.deepcopy(cfg)
+        twice.update(roots=[str(pics)], media={**real.get("media", {}), "roots": [str(pics), str(pics / "trip")]})
+        twice["skip"] = {**real["skip"], "under": []}
+        got = [f for f, _, _ in indexer.walk(twice, collections.Counter())]
+        check("a folder listed twice gives each file once", sorted(got) == sorted(set(got)) and len(got) == 2,
+              str([os.path.basename(f) for f in got]))
+        junk = tmp / "junk.txt"
+        junk.write_bytes(bytes(range(256)) * 40)
+        wide = tmp / "wide.txt"
+        wide.write_bytes("hello\tworld\n".encode("utf-16"))
+        check("binary data named .txt is not read as words; UTF-16 text still is",
+              indexer.read_text(str(junk)) == "" and indexer.read_text(str(wide)) == "hello\tworld\n")
+        # A PDF whose page size pdfinfo cannot read raised IndexError, which ocr_file did not catch: the run stopped.
+        import ocr
+        bad = tmp / "bad.pdf"
+        bad.write_text("not a pdf")
+        saved = ocr.image_only_pages
+        ocr.image_only_pages = lambda *a: (1, [1])
+        try:
+            res = indexer.ocr_file(str(bad), "pdf", real)
+        except Exception as e:  # noqa: BLE001
+            res = e
+        finally:
+            ocr.image_only_pages = saved
+        check("a broken PDF in the OCR step is logged, not fatal", isinstance(res, tuple) and res[2], repr(res)[:120])
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

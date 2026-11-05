@@ -124,6 +124,8 @@ class Watcher:
                 self.pending.update(self.running_paths)
                 self.retry_at = time.time() + 120
             else:
+                if code:   # e.g. a crash: say so in app.log instead of passing it off as an update
+                    self.log(f"watch: update stopped with exit {code}, see logs/watch.out")
                 self.state["last_update"] = time.time()
                 self.state["last_update_files"] = self._changed_count()
                 self._save_state()

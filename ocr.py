@@ -41,9 +41,10 @@ def render_page(pdf, page, out_dir, dpi=DPI, max_px=MAX_PX):
     longer than max_px: a 48 x 67 cm page holding a 72 dpi scan would otherwise become a 45-megapixel upscale that
     Vision needs minutes for."""
     stem = Path(out_dir) / f"p{page}"
-    size = [float(x) for x in re.findall(r"Page\s+\d+\s+size:\s+([\d.]+) x ([\d.]+)", subprocess.run(
+    found = re.findall(r"Page\s+\d+\s+size:\s+([\d.]+) x ([\d.]+)", subprocess.run(
         ["/opt/homebrew/bin/pdfinfo", "-f", str(page), "-l", str(page), str(pdf)], capture_output=True, text=True,
-        timeout=60).stdout)[0]] or [0, 0]
+        timeout=60).stdout)
+    size = [float(x) for x in found[0]] if found else [0, 0]   # no size read: plain 300 dpi
     scale = ["-r", str(dpi)] if max(size) * dpi / 72 <= max_px else ["-scale-to", str(max_px)]
     subprocess.run([PDFTOPPM, *scale, "-f", str(page), "-l", str(page), "-singlefile", "-png", str(pdf),
                     str(stem)], check=True, capture_output=True, timeout=300)
