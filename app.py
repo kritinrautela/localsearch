@@ -532,7 +532,7 @@ def prefix_mode(q):
     if re.match(r":[a-z]", q, re.IGNORECASE):
         return "emoji", q[1:]
     if re.match(r"emoji\s", q, re.IGNORECASE):
-        return "emoji", q.split(None, 1)[1]
+        return "emoji", (q.split(None, 1) + [""])[1]
     if re.match(r"(snip|snippet|snippets)(\s|$)", q, re.IGNORECASE):
         return "snip", q.split(None, 1)[1] if " " in q.strip() else ""
     m = re.match(r"(name|code|clip|like):\s*(.*)$", q, re.IGNORECASE | re.DOTALL)
@@ -2631,6 +2631,9 @@ class Preview:
             if doc is not None and doc.pageCount() > 0:
                 n = max(0, min((row.get("page") or 1) - 1, doc.pageCount() - 1))
                 page = doc.pageAtIndex_(n)
+                # PDFKit draws pages on a background thread; keep the last few documents alive so a page from the one
+                # just left is never drawn after its document is gone ("PDFPage when its PDFDocument is nil").
+                self.pdf_keep = (getattr(self, "pdf_keep", []) + [doc])[-4:]
                 self.pdf.setDocument_(doc)
                 self.pdf.goToPage_(page)
                 found = []

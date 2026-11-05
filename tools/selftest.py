@@ -247,6 +247,22 @@ def test_pause_targets():
     check("'pdf files' and 'my photos' list that kind; a lone minus is ignored; 'gold pdf' still searches gold",
           pf[0] == ("", {"pdf"}) and pf[1][0] == "" and pf[1][1] and pf[2][0] == "pdf" and pf[3] == ("gold", {"pdf"})
           and pf[4] == ("pdf", set()), str(pf))
+    import common, json as _json, io
+    class R(io.BytesIO):
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+    e = common.Embedder.__new__(common.Embedder)
+    e.url, e.cfg = "http://x", {"dim": 2}
+    real = common.OPENER.open
+    common.OPENER.open = lambda req, timeout=0: R(_json.dumps({"data": [
+        {"index": 0, "embedding": [1, 0]}, {"index": 2, "embedding": [0, 1]}]} if b'"a"' in req.data and b'"b"' in req.data
+        else {"data": [{"index": 0, "embedding": [1, 0]}]}).encode())
+    try:
+        out = e.embed(["a", "b"])
+    finally:
+        common.OPENER.open = real
+    check("a short reply from the embedder never shifts vectors onto other text", len(out) == 2 and all(
+        v is not None for v in out))
     a, b = str(app.HOME / "x/a.pdf"), str(app.HOME / "y/b.pdf")
     rows = [{"path": a, "name": "a.pdf"}, {"path": str(app.HOME / "z.txt"), "name": "z.txt"}]
     moved, gone = app.follow_file(rows, a, b), app.follow_file(rows, a, None)

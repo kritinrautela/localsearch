@@ -318,6 +318,8 @@ class Embedder:
         with OPENER.open(req, timeout=600) as r:
             data = json.load(r)["data"]
         data.sort(key=lambda d: d["index"])
+        if [d["index"] for d in data] != list(range(len(inputs))):
+            raise ValueError("server skipped or repeated a row")   # never let vectors slide onto the wrong text
         return np.asarray([d["embedding"] for d in data], dtype=np.float32)
 
     def embed(self, texts):
