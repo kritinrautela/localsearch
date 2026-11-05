@@ -139,12 +139,30 @@ def walk(cfg, only=None):
     bundles = tuple(cfg["skip"]["bundle_suffixes"])
     seen = set()
     ignore = GitIgnore()
-    for root in (only or code_roots(cfg)):
+    tops = [str(r) for r in code_roots(cfg)]
+    for root in (only or tops):
+        root = str(root)
+        if only:
+            # A quick update of one changed folder: read the .gitignore files above it too, and pass over a folder
+            # that a full run would never reach (ignored, skipped, hidden, or a build folder above it).
+            top = next((r for r in tops if root == r or root.startswith(r + "/")), None)
+            if top is None:
+                continue
+            parts, cur, keep = root[len(top):].strip("/").split("/") if root != top else [], top, True
+            for part in parts:
+                ignore.load(cur)
+                cur = os.path.join(cur, part)
+                if (part.startswith(".") or part in SKIP_DIRS or part.lower().endswith(bundles)
+                        or any(cur == u or cur.startswith(u + "/") for u in under) or ignore.ignored(cur, True)):
+                    keep = False
+                    break
+            if not keep:
+                continue
         for dirpath, dirs, files in os.walk(root):
             ignore.load(dirpath)
             dirs[:] = [d for d in dirs if not d.startswith(".") and d not in SKIP_DIRS
-                       and not d.lower().endswith(bundles) and not any(os.path.join(dirpath, d).startswith(u)
-                                                                       for u in under)
+                       and not d.lower().endswith(bundles) and not any(
+                           os.path.join(dirpath, d) == u or os.path.join(dirpath, d).startswith(u + "/") for u in under)
                        and not os.path.islink(os.path.join(dirpath, d))
                        and not ignore.ignored(os.path.join(dirpath, d), True)]
             for f in files:
@@ -153,15 +171,15 @@ def walk(cfg, only=None):
                 doc = ext == "md" and (f.lower().startswith(DOC_NAMES) or os.path.basename(dirpath).lower() == "docs")
                 if (ext not in CODE_EXT and not doc) or skipped(f, cfg) or f.endswith((".min.js", ".min.css", ".lock")):
                     continue
-                if ignore.ignored(full, False) or getattr(os.stat(full, follow_symlinks=False), "st_flags", 0) & 0x40000000:
+                if ignore.ignored(full, False) or full in seen:
                     continue
-                if full in seen or os.path.islink(full):
-                    continue
-                seen.add(full)
-                try:
-                    st = os.stat(full)
+                try:   # a file can go between the listing and here (a test run's temp files, a save by rename)
+                    st = os.stat(full, follow_symlinks=False)
                 except OSError:
                     continue
+                if getattr(st, "st_flags", 0) & 0x40000000 or os.path.islink(full):   # online-only, or a link
+                    continue
+                seen.add(full)
                 if 0 < st.st_size <= MAX_BYTES:
                     yield full, st
 

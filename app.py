@@ -1610,8 +1610,7 @@ class Engine:
         self.q.put(("load", None, None))
 
     def index_stamp(self):
-        p = expand(self.cfg["index"])
-        return max((os.stat(f).st_mtime for f in (p, Path(str(p) + "-wal")) if os.path.exists(f)), default=0)
+        return db_stamp(expand(self.cfg["index"]))
 
     def post(self, query):
         with self.lock:
@@ -1764,11 +1763,27 @@ class Engine:
             except Exception as e:  # the server went away mid-query: drop it and answer on keywords
                 dbg("search fell back to keywords:", e)
                 self.emb, emb = None, None
-                hits = self.searcher.search(asked, "hybrid", self.k, qvec=zero, exts=self.exts)
+                try:
+                    hits = self.searcher.search(asked, "hybrid", self.k, qvec=zero, exts=self.exts)
+                except Exception as e:   # not the server: answer empty rather than end this thread for good
+                    dbg("search failed:", e)
+                    hits = []
             info = {"ms": (time.time() - t) * 1000, "keywords_only": emb is None, "respelled": sorted(set(fixes.values()))}
             AppHelper.callAfter(self.on_results, gen, query, hits, info)
             if emb is not None and not query.startswith("like:") and wants_rerank(asked, hits):
                 self.rq.put((gen, query, asked, hits, info))
+
+
+def db_stamp(path):
+    """Newest change time of an index and its -wal file. The -wal file goes when the indexer closes, so it can vanish
+    between a check and a stat: a vanished file is simply left out."""
+    out = 0
+    for f in (path, Path(str(path) + "-wal")):
+        try:
+            out = max(out, os.stat(f).st_mtime)
+        except OSError:
+            pass
+    return out
 
 
 class CodeEngine:
@@ -1793,8 +1808,8 @@ class CodeEngine:
             if not path.exists():
                 AppHelper.callAfter(self.on_results, gen, query, [])
                 continue
-            stamp = max(os.stat(f).st_mtime for f in (path, Path(str(path) + "-wal")) if os.path.exists(f))
             try:
+                stamp = db_stamp(path)
                 if self.searcher is None or stamp > self.stamp:
                     old, self.searcher, self.stamp = self.searcher, codesearch.CodeSearcher(self.cfg), stamp
                     if old is not None:

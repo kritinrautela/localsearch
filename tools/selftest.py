@@ -136,6 +136,76 @@ def test_cloud_root(real):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_engine_survives(real):
+    """2026-11-06: a search that failed for a reason other than the embedder was retried unguarded, which ended the
+    search thread: the window stopped answering until the app restarted. And a -wal file that vanished between an
+    exists check and a stat raised in the main thread."""
+    import queue
+    import threading
+    import app
+    seen = []
+    e = app.Engine.__new__(app.Engine)
+    e.cfg, e.gen, e.k, e.exts, e.lock = real, 0, 10, None, threading.Lock()
+    e.q, e.rq, e.emb, e.emb_starting, e.last_use = queue.Queue(), queue.Queue(), None, True, time.time()
+    e.on_results = lambda gen, q, hits, info: seen.append((q, hits))
+
+    class Broken:
+        def respell(self, q):
+            return q, {}
+
+        def search(self, *a, **k):
+            if seen:
+                return ["ok"]
+            raise sqlite3.OperationalError("database is locked")
+    e.searcher = Broken()
+    saved = app.AppHelper.callAfter
+    app.AppHelper.callAfter = lambda f, *a: f(*a)
+    try:
+        threading.Thread(target=e._loop, daemon=True).start()
+        e.post("first")
+        deadline = time.time() + 5
+        while not seen and time.time() < deadline:
+            time.sleep(0.05)
+        e.post("second")
+        while len(seen) < 2 and time.time() < deadline:
+            time.sleep(0.05)
+    finally:
+        app.AppHelper.callAfter = saved
+    check("a failing search answers empty and the next search still runs",
+          seen == [("first", []), ("second", ["ok"])], str(seen))
+    tmp = Path(tempfile.mkdtemp(prefix="ls-stamp-"))
+    try:
+        (tmp / "i.sqlite").write_text("x")
+        check("an index stamp with no -wal file (or none at all) does not raise",
+              app.db_stamp(tmp / "i.sqlite") > 0 and app.db_stamp(tmp / "missing.sqlite") == 0)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_code_quick(real):
+    """2026-11-06: a quick code update of one changed folder never read the .gitignore files above it, so ignored code
+    (generated files, a gitignored folder) showed in code: results until the next full run."""
+    import codesearch
+    tmp = Path(tempfile.mkdtemp(prefix="ls-code-"))
+    try:
+        repo = tmp / "repo"
+        (repo / "src" / "gen").mkdir(parents=True)
+        (repo / ".gitignore").write_text("gen/\n*_pb2.py\n")
+        (repo / "src" / "gen" / "auto.py").write_text("def generated(): pass\n")
+        (repo / "src" / "msg_pb2.py").write_text("def proto(): pass\n")
+        (repo / "src" / "real.py").write_text("def real(): pass\n")
+        cfg = copy.deepcopy(real)
+        cfg["code"] = {"roots": [str(tmp)]}
+
+        def names(only=None):
+            return sorted(os.path.basename(f) for f, _ in codesearch.walk(cfg, only))
+        full, quick, inside = names(), names([repo / "src"]), names([repo / "src" / "gen"])
+        check("a quick code update keeps the .gitignore rules above the changed folder",
+              full == quick == ["real.py"] and inside == [], f"full {full}, quick {quick}, ignored folder {inside}")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def test_big_sheets():
     """A CSV keeps its first SHEET_CHARS of text and says how many rows were left out (one giant line too), and a
     file in a same_as copy folder is passed over only while the other copy has the same size."""
@@ -632,6 +702,8 @@ def main():
     guarded("pause targets", test_pause_targets)
     guarded("cloud folders", lambda: test_cloud_root(real))
     guarded("big sheets", test_big_sheets)
+    guarded("code quick update", lambda: test_code_quick(real))
+    guarded("search thread", lambda: test_engine_survives(real))
     guarded("reranker", lambda: test_rerank(real))
     guarded("fresh install", lambda: test_fresh_install(real))
     after = real_counts(real)
