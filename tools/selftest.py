@@ -238,6 +238,15 @@ def test_pause_targets():
           app.rename_problem("a.pdf", "x/y.pdf", str(HERE)), app.rename_problem("a.pdf", ".hidden", str(HERE)),
           app.rename_problem("a.pdf", "app.py", str(HERE))]
     check("rename refuses empty, slashes, hidden names and overwriting", ok[0] and all(ok[1:]), f"{sum(map(bool, ok))}/5")
+    a, b = str(app.HOME / "x/a.pdf"), str(app.HOME / "y/b.pdf")
+    rows = [{"path": a, "name": "a.pdf"}, {"path": str(app.HOME / "z.txt"), "name": "z.txt"}]
+    moved, gone = app.follow_file(rows, a, b), app.follow_file(rows, a, None)
+    rel = app.follow_file([{"path": "x/a.pdf"}], a, b, rel=True)
+    check("lists follow a renamed, moved or binned file",
+          moved[0] == {"path": b, "name": "b.pdf"} and len(gone) == 1 and rel == [{"path": "y/b.pdf"}])
+    src = (HERE / "app.py").read_text()
+    check("cmd-Backspace still edits the search text on a file row",
+          'self.file_row(row):\n            self.trash(row)' not in src and '"trash", "\\x08"' not in src)
     sh = (HERE / "tools/refresh.sh").read_text()
     check("a paused leftover wrapper cannot block refreshes", "kill -CONT" in sh
           and sh.index("kill -CONT") < sh.index("already running"))

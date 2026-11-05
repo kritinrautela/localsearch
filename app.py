@@ -1303,6 +1303,20 @@ APP_DIRS = ("/Applications/", "/System/Applications/", str(HOME / "Applications"
             "/System/Library/CoreServices/Applications/", "/System/Library/CoreServices/Finder.app")
 
 
+def follow_file(rows, old, new, rel=False):
+    """Rows pointing at a renamed/moved file get its new path (and name); a binned file (new=None) drops out."""
+    out = []
+    for r in rows or []:
+        if (str(HOME / r["path"]) if rel else r["path"]) == old:
+            if not new:
+                continue
+            r = dict(r, path=os.path.relpath(new, HOME) if rel else new)
+            if r.get("name") == os.path.basename(old):
+                r["name"] = os.path.basename(new)
+        out.append(r)
+    return out
+
+
 def rename_problem(old, new, folder):
     """Why this rename can't happen, or None when it can."""
     if not new or new == old:
@@ -2870,6 +2884,7 @@ class Controller(NSObject):
         self.history = History()
         self.apps = Apps(self.history)
         self.rows, self.hits, self.names = [], [], []
+        self.last_trash = None
         self.query, self.scope = "", 0
         self.clean, self.exts, self.places = "", set(), []
         self.recents = []
@@ -3494,9 +3509,7 @@ class Controller(NSObject):
         elif ch in ("\x7f", "\x08") and 0 <= row < len(self.rows) and self.rows[row]["kind"] == "snippet":
             self.snippets.forget(self.rows[row]["item"])
             self.rebuild()
-        elif ch in ("\x7f", "\x08") and self.file_row(row):
-            self.trash(row)
-        elif ch == "z" and not shift and getattr(self, "last_trash", None):
+        elif ch == "z" and not shift and self.last_trash and time.time() - self.last_trash[2] < 60:
             self.put_back()
         else:
             return False
@@ -3586,7 +3599,7 @@ class Controller(NSObject):
                 add(m, "Share…", "share", sym="square.and.arrow.up")
                 add(m, "Rename…", "rename", sym="pencil")
                 add(m, "Move to Folder…", "move", sym="folder.badge.plus")
-                add(m, "Move to Trash", "trash", "\x08", sym="trash")
+                add(m, "Move to Trash", "trash", sym="trash")
         if r["kind"] == "clip":
             m.addItem_(AppKit.NSMenuItem.separatorItem())
             add(m, "Forget This Item", "forget", "\x08", sym="trash")
@@ -4523,14 +4536,10 @@ class Controller(NSObject):
     @objc.python_method
     def file_moved(self, row, old, new, note):
         """Point the row (and pins) at the file's new place, or drop it, and say what happened."""
-        hits = []
-        for h in self.hits or []:
-            if str(HOME / h["path"]) == old:
-                if not new:
-                    continue
-                h = dict(h, path=os.path.relpath(new, HOME))
-            hits.append(h)
-        self.hits = hits
+        self.hits = follow_file(self.hits, old, new, rel=True)
+        self.code_hits = follow_file(getattr(self, "code_hits", None), old, new, rel=True)
+        self.recents = follow_file(self.recents, old, new)
+        self.fresh = follow_file(self.fresh, old, new)
         self.names = [new if p == old else p for p in (self.names or []) if new or p != old]
         if self.pins.has(old):
             self.pins.toggle("file", old, os.path.basename(old))
@@ -4631,12 +4640,12 @@ class Controller(NSObject):
         if not ok:
             self.foot_left.setStringValue_("Could not move it to the Trash" + (f": {err.localizedDescription()}" if err else ""))
             return
-        self.last_trash = (full, where.path() if where else None)
+        self.last_trash = (full, where.path() if where else None, time.time())
         self.file_moved(row, full, None, f"Moved {os.path.basename(full)} to the Trash · ⌘Z puts it back")
 
     @objc.python_method
     def put_back(self):
-        full, where = self.last_trash
+        full, where, _ = self.last_trash
         self.last_trash = None
         if not where or not os.path.exists(where) or os.path.exists(full):
             self.foot_left.setStringValue_("Could not put it back; use Put Back in the Trash")
